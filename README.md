@@ -37,6 +37,13 @@ MoviePilot-Plugins/
 └── .github/workflows/       # 发布工作流
 ```
 
+## 内置插件
+
+- **RSSHub 阅读器**（`plugins.v2/rsshub_reader`）：RSSHub 资讯源阅读器。功能包括：订阅源管理（增删改 + OPML 导入/导出迁移）、定时拉取 RSS/Atom 并解析文章、抓取正文以提取完整图片、后端图片代理（绕开豆瓣/B站等防盗链与跨域）、已读/未读标记、基于关键词或正则的规则通知。
+  - 前端为 Vuetify 单文件页面（`page.vue`），无需前端构建，全部运行于 MP 插件体系。
+  - 依赖采用「可用即用、缺失降级」策略：feedparser / requests / beautifulsoup4 在缺失时均自动回退标准库（xml.etree / urllib / html.parser），核心功能不受影响。
+  - 详细用法见插件目录内文档（`plugins.v2/rsshub_reader/`）。
+
 ## 版本与加载规则
 
 - MoviePilot 会优先读取 `package.v2.json` 中与当前版本标识匹配的插件定义。
