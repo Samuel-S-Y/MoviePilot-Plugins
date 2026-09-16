@@ -30,12 +30,14 @@
     "name": "RSSHub 阅读器",
     "description": "RSSHub 资讯源阅读器：订阅管理（OPML导入导出）、阅读文章、完整图片、已读标记、规则通知（含后端图片代理）",
     "labels": "RSS,rsshub,阅读器,资讯",
-    "version": "1.2.0",
+    "version": "1.3.0",
+    "system_version": ">=2.12.0",
     "icon": "rss.png",
     "author": "Samuel",
     "author_url": "https://github.com/jxxghp/MoviePilot-Plugins",
     "level": 1,
     "history": {
+      "v1.3.0": "接口层升级至 MP V2 框架：init_plugin/get_service/get_api/get_form 契约重写，新增 Vue 全页联邦前端（dist/assets）与侧边栏入口；修复 OPML 空导入误刷新、规则测试不过滤已读、通知去重记录堆积、图片代理 SSRF 风险、已读状态逐条落盘等逻辑问题",
       "v1.2.0": "初始化版本"
     }
   }

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RSSHubReader - MoviePilot v3 资讯源阅读器插件
+RSSHubReader - MoviePilot 资讯源阅读器插件
 
 功能：
   - 管理订阅源（增删改，存于插件数据目录 feeds.json）
@@ -12,10 +12,10 @@ RSSHubReader - MoviePilot v3 资讯源阅读器插件
   - **规则通知**：按字段（标题/描述/作者/分类/链接）+ 关键词或正则配置正向规则，
     刷新时对新条目匹配，命中即通过 MP 通知组件（MessageCenter / 各渠道）提醒，
     已通知/已读条目自动去重，通知后标记已读
-  - Vuetify JSON 前端：订阅源管理 + 文章列表 + 图片画廊 + 通知规则管理
+  - Vue 全页前端（模块联邦构建产物 dist/assets）：订阅源管理 + 文章列表 + 图片画廊 + 通知规则管理
 
 技术栈：feedparser（RSS/Atom）+ requests（正文抓取）+ BeautifulSoup（提取图片）
-全部运行于 MP 插件体系，无需 Node/前端构建。
+前端需先在插件目录执行 npm install && npm run build，产物提交到 dist/assets。
 """
 
 import os
@@ -25,7 +25,7 @@ import json
 import time
 import hashlib
 from datetime import datetime
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
 # ---- 依赖采用「可用即用、缺失降级」策略 ----
@@ -53,31 +53,68 @@ except ImportError:
 
 # 兼容双环境：有 MoviePilot 运行时正常导入；本地测试时用桩替代
 try:
-    from app.helper import StorageHelper
-    from app.schemas import NotificationType
     from app.log import logger
-    from plugins._pluginbase import _PluginBase
+    from app.plugins import _PluginBase
+    from app.schemas import MessageChannel, NotificationType
 except ImportError:  # pragma: no cover - 本地测试桩
-    class StorageHelper:
-        @staticmethod
-        def get_data_path(name):
-            path = os.path.join(os.path.dirname(__file__), "_test_data", name)
-            os.makedirs(path, exist_ok=True)
-            return path
-
-    class NotificationType:
-        Info = "info"
-
     import logging
+
     logger = logging.getLogger(__name__)
     logging.basicConfig(level=logging.INFO)
 
+    class MessageChannel:
+        Telegram = "Telegram"
+        Feishu = "Feishu"
+        Slack = "Slack"
+        Discord = "Discord"
+        WebPush = "WebPush"
+
+    class NotificationType:
+        Plugin = "plugin"
+        Info = "info"
+
     class _PluginBase:
-        config = {}
-        def init(self, **kwargs):
+        def init_plugin(self, config: dict = None):
             pass
-        def get_config(self, key, default=None):
-            return (self.config or {}).get(key, default)
+
+        def get_state(self) -> bool:
+            return True
+
+        def get_api(self):
+            return []
+
+        def get_form(self):
+            return [], {}
+
+        def get_page(self):
+            return None
+
+        def get_service(self):
+            return []
+
+        def stop_service(self):
+            pass
+
+        def get_config(self, plugin_id: str = None):
+            return {}
+
+        def get_data_path(self, plugin_id: str = None):
+            path = os.path.join(os.path.dirname(__file__), "_test_data", self.__class__.__name__)
+            os.makedirs(path, exist_ok=True)
+            return path
+
+        def post_message(self, channel=None, mtype=None, title=None, text=None,
+                         image=None, link=None, **kwargs):
+            logger.info(f"[插件桩] post_message: {title} | {text}")
+
+
+# FastAPI 类型：仅在 MP 运行时存在；本地测试桩下为 None（接口由 MP 的 add_api_route 调用）
+try:
+    from fastapi import Request
+    from fastapi.responses import Response
+except ImportError:  # pragma: no cover - 本地测试桩
+    Request = None
+    Response = None
 
 
 # ---------- 常量 ----------
@@ -171,7 +208,8 @@ def _extract_images_bs4(html: str, base_url: str) -> list:
         if src:
             candidates.append(src)
         for c in candidates:
-            abs_url = _absolutize(base_url, c).split("?")[0]
+            # 保留完整 URL（含 query）：部分 CDN 图片地址带签名参数，截断会导致 403
+            abs_url = _absolutize(base_url, c)
             if not abs_url or abs_url in seen:
                 continue
             low = abs_url.lower()
@@ -205,7 +243,8 @@ def _extract_images_stdlib(html: str, base_url: str) -> list:
             if "src" in d and d["src"]:
                 cands.append(d["src"])
             for c in cands:
-                u = _absolutize(base_url, c).split("?")[0]
+                # 保留完整 URL（含 query）：部分 CDN 图片地址带签名参数，截断会导致 403
+                u = _absolutize(base_url, c)
                 if u and u not in self.urls:
                     low = u.lower()
                     if not any(k in low for k in ("avatar", "placeholder", "pixel.", "1x1.", "blank.gif")):
@@ -296,11 +335,11 @@ def parse_feed(feed_url: str, fetch_full: bool) -> dict:
     resp.raise_for_status()
 
     if HAVE_FEEDPARSER:
-        return _parse_feed_feedparser(resp.content, feed_url, fetch_full)
-    return _parse_feed_stdlib(resp.content, feed_url, fetch_full)
+        return _parse_feed_feedparser(resp.content, fetch_full)
+    return _parse_feed_stdlib(resp.content, fetch_full)
 
 
-def _parse_feed_feedparser(content: bytes, feed_url: str, fetch_full: bool) -> dict:
+def _parse_feed_feedparser(content: bytes, fetch_full: bool) -> dict:
     parsed = _feedparser.parse(content)
     feed_title = ""
     if hasattr(parsed, "feed"):
@@ -350,7 +389,7 @@ def _parse_feed_feedparser(content: bytes, feed_url: str, fetch_full: bool) -> d
     return {"title": feed_title, "entries": entries}
 
 
-def _parse_feed_stdlib(content: bytes, feed_url: str, fetch_full: bool) -> dict:
+def _parse_feed_stdlib(content: bytes, fetch_full: bool) -> dict:
     """无 feedparser 时的降级解析（标准库 xml.etree，支持 RSS 2.0 / Atom）。"""
     root = ET.fromstring(content)
     # Atom: feed > entry；RSS: rss > channel > item
@@ -440,8 +479,18 @@ class RsshubReader(_PluginBase):
     # ---- 插件元信息（MP 后台“插件市场”展示用）----
     plugin_name = PLUGIN_NAME
     plugin_desc = "RSSHub 资讯源阅读器：订阅管理（OPML导入导出）、阅读文章、完整图片、已读标记、规则通知（含后端图片代理）"
-    version = "1.2.0"
-    author = "your-name"
+    plugin_version = "1.3.0"
+    plugin_author = "your-name"
+
+    # ---- 通知渠道映射：规则 channel → MP 消息渠道（None 表示走 MP 默认分发）----
+    _CHANNEL_MAP = {
+        "MessageCenter": None,
+        "Telegram": MessageChannel.Telegram,
+        "Feishu": MessageChannel.Feishu,
+        "Slack": MessageChannel.Slack,
+        "Discord": MessageChannel.Discord,
+        "WebPush": MessageChannel.WebPush,
+    }
 
     # ---- 持久化 ----
     # 数据目录由 MP 提供，位于插件数据根下，重启不丢失
@@ -457,23 +506,22 @@ class RsshubReader(_PluginBase):
     _read_status: dict = {}
 
     # ================= 生命周期 =================
-    def init(self, **kwargs):
+    def init_plugin(self, config: dict = None):
         """
-        插件加载时调用：初始化数据目录与文件。
-        幂等：MP 重载插件时可能多次调用，用 _initialized 守护，避免状态被清空。
+        MP V2 生命周期入口：插件加载/配置变更时调用。
+        幂等：重载时不重复初始化内存状态（_initialized 守护）。
         """
+        self._config = config or {}
         if getattr(self, "_initialized", False):
             return
-        super().init(**kwargs)
-        self._data_dir = StorageHelper.get_data_path(self.__class__.__name__)
+        # 数据目录由 MP 基类提供（插件数据根目录下）
+        self._data_dir = str(self.get_data_path())
         os.makedirs(self._data_dir, exist_ok=True)
         self._feeds_file = os.path.join(self._data_dir, "feeds.json")
         self._cache_file = os.path.join(self._data_dir, "articles.json")
         self._read_file = os.path.join(self._data_dir, "read_status.json")
         self._rules_file = os.path.join(self._data_dir, "notify_rules.json")
         self._notified_file = os.path.join(self._data_dir, "notified_entries.json")
-        # OPML 导入暂存目录（存放用户上传的 .opml 文件）
-        os.makedirs(os.path.join(self._data_dir, "opml_imports"), exist_ok=True)
         # 内存状态（首次启动时为空；已在 refresh_all 中惰性恢复缓存）
         self._articles = getattr(self, "_articles", {})
         self._read_status = self._load_read_status()
@@ -482,137 +530,253 @@ class RsshubReader(_PluginBase):
         self._initialized = True
         logger.info(f"[{PLUGIN_NAME}] 数据目录: {self._data_dir}")
 
-    def destroy(self):
-        """插件卸载/重载时调用：落盘状态，避免丢失。"""
+    def get_state(self) -> bool:
+        """插件启用状态（配置表单 enabled 开关）。"""
+        return bool(self._cfg("enabled", True))
+
+    def stop_service(self):
+        """插件停止/卸载时调用：落盘内存状态，避免丢失。"""
         try:
             self._save_read_status()
             self._save_notified()
             self._save_rules()
         except Exception:
             pass
-        logger.info(f"[{PLUGIN_NAME}] 已销毁")
+        logger.info(f"[{PLUGIN_NAME}] 服务已停止")
 
     # ================= 配置表单 =================
-    def get_form(self) -> dict:
+    def get_form(self) -> tuple:
         """
-        后台“设置”页的表单。这里只放真正需要用户改的项，
+        后台“设置”页的表单（Vuetify JSON + 默认值字典）。
         源列表管理放到前端页面（增删更友好）。
         """
-        return {
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "rsshub_base_url": {
-                        "type": "string",
-                        "title": "RSSHub 地址",
-                        "description": "局域网 RSSHub 访问地址，如 http://192.168.1.100:1200",
-                        "default": "http://127.0.0.1:1200",
-                    },
-                    "poll_interval": {
-                        "type": "integer",
-                        "title": "刷新间隔（分钟）",
-                        "description": "定时拉取所有订阅源的周期，建议 15~60",
-                        "default": 30,
-                        "minimum": 5,
-                        "maximum": 1440,
-                    },
-                    "fetch_full": {
-                        "type": "boolean",
-                        "title": "抓取正文提取完整图片",
-                        "description": "开启后会对文章页抓取以提取全部图片，较慢；关闭则只用 RSS 内嵌图片",
-                        "default": True,
-                    },
-                    "proxy_images": {
-                        "type": "boolean",
-                        "title": "启用后端图片代理",
-                        "description": "通过本插件转发图片，绕开豆瓣/B站等防盗链与跨域，建议开启",
-                        "default": True,
-                    },
-                    "max_entries": {
-                        "type": "integer",
-                        "title": "每个源保留条数",
-                        "description": "每个订阅源最多保留的文章数，避免内存膨胀",
-                        "default": 50,
-                        "minimum": 10,
-                        "maximum": 500,
-                    },
-                    "opml_group": {
-                        "type": "string",
-                        "title": "OPML 默认分组",
-                        "description": "OPML 导入时若源未指定分组，使用此名称；留空则不分组",
-                        "default": "导入",
-                    },
-                    "mark_read_on_open": {
-                        "type": "boolean",
-                        "title": "打开文章自动标为已读",
-                        "description": "开启后，点开文章详情即标记为已读",
-                        "default": True,
-                    },
-                    "notify_channel": {
-                        "type": "string",
-                        "title": "规则通知渠道",
-                        "description": "命中规则时使用的通知渠道；单条规则可单独指定，留空则使用此默认值",
-                        "default": "MessageCenter",
-                        "enum": [
-                            "MessageCenter",
-                            "Telegram",
-                            "ServerChan",
-                            "PushPlus",
-                            "WeChatWork",
-                            "Webhook",
+        fields = [
+            {
+                "component": "VForm",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}}
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "rsshub_base_url",
+                                            "label": "RSSHub 地址",
+                                            "hint": "局域网 RSSHub 访问地址，如 http://192.168.1.100:1200",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "poll_interval",
+                                            "label": "刷新间隔（分钟）",
+                                            "type": "number",
+                                            "hint": "定时拉取所有订阅源的周期，建议 15~60",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "max_entries",
+                                            "label": "每个源保留条数",
+                                            "type": "number",
+                                            "hint": "最多保留的文章数，避免内存膨胀",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "max_notify_log",
+                                            "label": "通知记录保留条数",
+                                            "type": "number",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "fetch_full", "label": "抓取正文提取完整图片"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "proxy_images", "label": "启用后端图片代理"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "mark_read_on_open", "label": "打开文章自动标为已读"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "notify_enabled", "label": "启用规则通知"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "opml_group",
+                                            "label": "OPML 默认分组",
+                                            "hint": "OPML 导入时未指定分组的源归入此分组",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "notify_template",
+                                            "label": "通知内容模板",
+                                            "hint": "支持变量：{title} {feed} {link} {rule} {published}",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "notify_channel",
+                                            "label": "默认通知渠道",
+                                            "items": [
+                                                {"title": "MessageCenter（默认分发）", "value": "MessageCenter"},
+                                                {"title": "Telegram", "value": "Telegram"},
+                                                {"title": "飞书", "value": "Feishu"},
+                                                {"title": "Slack", "value": "Slack"},
+                                                {"title": "Discord", "value": "Discord"},
+                                                {"title": "WebPush", "value": "WebPush"},
+                                                {"title": "Webhook", "value": "Webhook"},
+                                            ],
+                                            "hint": "命中规则时的默认通知渠道；单条规则可单独指定",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "webhook_url",
+                                            "label": "Webhook 地址",
+                                            "hint": "渠道选择 Webhook 时，命中规则将 POST JSON 到此地址",
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     },
-                    "notify_enabled": {
-                        "type": "boolean",
-                        "title": "启用规则通知",
-                        "description": "关闭后，刷新不再触发规则匹配与通知（保留规则配置）",
-                        "default": True,
-                    },
-                    "notify_template": {
-                        "type": "string",
-                        "title": "通知内容模板",
-                        "description": "支持变量：{title} 标题、{feed} 源名、{link} 原文链接、{rule} 命中规则名",
-                        "default": "📰 [{feed}] {title}\n命中规则：{rule}\n{link}",
-                    },
-                    "max_notify_log": {
-                        "type": "integer",
-                        "title": "通知记录保留条数",
-                        "description": "『最近通知记录』最多保留条数，避免文件膨胀",
-                        "default": 200,
-                        "minimum": 10,
-                        "maximum": 2000,
-                    },
-                },
-                "required": ["rsshub_base_url", "poll_interval"],
+                ],
             },
-            "ui": {
-                "rsshub_base_url": {"placeholder": "http://127.0.0.1:1200"},
-            },
+        ]
+        defaults = {
+            "enabled": True,
+            "rsshub_base_url": "http://127.0.0.1:1200",
+            "poll_interval": 30,
+            "max_entries": 50,
+            "max_notify_log": 200,
+            "fetch_full": True,
+            "proxy_images": True,
+            "mark_read_on_open": True,
+            "notify_enabled": True,
+            "opml_group": "导入",
+            "notify_template": "📰 [{feed}] {title}\n命中规则：{rule}\n{link}",
+            "notify_channel": "MessageCenter",
+            "webhook_url": "",
         }
+        return fields, defaults
 
     # ================= 定时任务 =================
-    def get_service(self) -> dict:
+    def get_service(self) -> list:
         """
-        注册定时刷新任务。
-        MP 调度器按配置的 poll_interval 周期性调用 self.refresh_all。
+        注册定时刷新任务（MP V2：返回服务列表，按配置的 poll_interval 周期调用 refresh_all）。
         """
-        interval = int(self.get_config("poll_interval", 30))
-        return {
-            "name": "rsshub_reader.refresh",
+        if not self.get_state():
+            return []
+        interval = max(5, int(self._cfg("poll_interval", 30)))
+        return [{
+            "id": "rsshub_reader_refresh",
+            "name": "RSS 源定时刷新",
+            "trigger": "interval",
             "func": self.refresh_all,
-            "interval": interval,  # 分钟
-        }
+            "kwargs": {"minutes": interval},
+        }]
 
     # ---- 对外：供 API / 前端触发手动刷新 ----
     def refresh_all(self, *_args, **_kwargs):
         """遍历所有订阅源并拉取，结果同时写内存与磁盘缓存。"""
+        # 先恢复磁盘缓存：重启后首次刷新时，失败的源可以从旧缓存兜底，不会被清空
+        self._maybe_load_cache()
         feeds = self._load_feeds()
         if not feeds:
             logger.debug(f"[{PLUGIN_NAME}] 暂无订阅源，跳过刷新")
             return
 
-        max_entries = int(self.get_config("max_entries", 50))
-        fetch_full = bool(self.get_config("fetch_full", True))
+        max_entries = int(self._cfg("max_entries", 50))
+        fetch_full = bool(self._cfg("fetch_full", True))
 
         articles = {}
         for feed in feeds:
@@ -636,113 +800,132 @@ class RsshubReader(_PluginBase):
 
         self._articles = articles
         self._save_cache(articles)
-        # 刷新后清理失效的已读记录（惰性，仅在记录量大时真正执行）
+        # 刷新后清理失效的已读/已通知记录（惰性，仅在记录量大时真正执行）
         self._maybe_gc_read_status()
+        self._maybe_gc_notified()
         # 规则通知：仅对新出现的条目进行匹配（去重 + 已读联动在 match 内部处理）
-        if bool(self.get_config("notify_enabled", True)):
+        if bool(self._cfg("notify_enabled", True)):
             self._process_notify(articles)
 
     # ================= 自定义 API =================
     def get_api(self) -> list:
         """
         暴露给前端的 HTTP 接口（由 MP 统一挂载在 /api/v1/plugin/{plugin_name}/...）。
-        前端通过 window.PluginAPI 调用。
+        MP 会将该字典直接展开传给 app.add_api_route，因此：
+          - path 必须以 / 开头；
+          - endpoint 使用框架要求的字段名（不能是 func）；
+          - 前端页面调用的接口使用 auth=bear（与前端 pluginApi 的 token 配套）；
+          - proxy 为 <img> 直链，标记 allow_anonymous，服务端做白名单校验防 SSRF。
         """
         return [
             {
-                "path": "feeds",
+                "path": "/feeds",
+                "endpoint": self.api_feeds,
                 "methods": ["GET", "POST", "DELETE"],
-                "func": self.api_feeds,
+                "auth": "bear",
                 "summary": "订阅源管理（列表/添加/删除）",
             },
             {
-                "path": "articles",
+                "path": "/articles",
+                "endpoint": self.api_articles,
                 "methods": ["GET"],
-                "func": self.api_articles,
+                "auth": "bear",
                 "summary": "获取所有/指定源的文章",
             },
             {
-                "path": "refresh",
+                "path": "/refresh",
+                "endpoint": self.api_refresh,
                 "methods": ["POST"],
-                "func": self.api_refresh,
+                "auth": "bear",
                 "summary": "手动触发刷新",
             },
             {
-                "path": "proxy",
+                "path": "/proxy",
+                "endpoint": self.api_proxy,
                 "methods": ["GET"],
-                "func": self.api_proxy,
-                "summary": "图片代理（绕开防盗链/跨域）",
+                "allow_anonymous": True,
+                "summary": "图片代理（仅允许缓存中的图片地址，防 SSRF）",
             },
             # ---- OPML 导入/导出 ----
             {
-                "path": "opml/export",
+                "path": "/opml/export",
+                "endpoint": self.api_opml_export,
                 "methods": ["GET"],
-                "func": self.api_opml_export,
-                "summary": "导出 OPML（订阅源备份/迁移）",
+                "auth": "bear",
+                "summary": "导出 OPML（订阅源备份/迁移，返回文本由前端生成下载）",
             },
             {
-                "path": "opml/import",
+                "path": "/opml/import",
+                "endpoint": self.api_opml_import,
                 "methods": ["POST"],
-                "func": self.api_opml_import,
+                "auth": "bear",
                 "summary": "导入 OPML（从其它阅读器迁移订阅源）",
             },
             # ---- 已读/未读标记 ----
             {
-                "path": "read",
+                "path": "/read",
+                "endpoint": self.api_read,
                 "methods": ["POST", "DELETE"],
-                "func": self.api_read,
+                "auth": "bear",
                 "summary": "标记单条已读/未读",
             },
             {
-                "path": "read/all",
+                "path": "/read/all",
+                "endpoint": self.api_read_all,
                 "methods": ["POST"],
-                "func": self.api_read_all,
+                "auth": "bear",
                 "summary": "将指定源（或全部）标记为已读",
             },
             # ---- 规则通知 ----
             {
-                "path": "rules",
+                "path": "/rules",
+                "endpoint": self.api_rules,
                 "methods": ["GET", "POST", "DELETE"],
-                "func": self.api_rules,
+                "auth": "bear",
                 "summary": "通知规则管理（列表/添加/删除）",
             },
             {
-                "path": "rules/test",
+                "path": "/rules/test",
+                "endpoint": self.api_rules_test,
                 "methods": ["POST"],
-                "func": self.api_rules_test,
+                "auth": "bear",
                 "summary": "测试规则匹配（对当前缓存文章试运行，不发送通知）",
             },
             {
-                "path": "notify/log",
+                "path": "/notify/log",
+                "endpoint": self.api_notify_log,
                 "methods": ["GET", "DELETE"],
-                "func": self.api_notify_log,
+                "auth": "bear",
                 "summary": "通知记录（查询/清空）",
             },
         ]
 
-    # 路由表便于自查（非正式 API）
-    def api_routes(self, **_):
-        """返回当前注册的 API 路由清单，供前端/调试使用。"""
-        return {
-            "ok": True,
-            "routes": [
-                {"path": a["path"], "methods": a["methods"], "summary": a["summary"]}
-                for a in self.get_api()
-            ],
-        }
+    @staticmethod
+    async def _read_json_body(request) -> dict:
+        """
+        读取请求体 JSON（FastAPI Request 注入）。
+        无 body / 非 JSON 时返回空字典，避免接口因缺 body 直接 422。
+        """
+        try:
+            return await request.json() or {}
+        except Exception:
+            return {}
 
     # ---- API 实现 ----
-    def api_feeds(self, url: str = None, method: str = "GET", payload: dict = None, **_):
+    async def api_feeds(self, request) -> dict:
         """
         GET 列表（附分组、未读数）/ POST 添加 / DELETE 删除。
         添加时支持 group 字段，便于 OPML 导入与前端分组管理。
         """
+        method = request.method
+        params = dict(request.query_params)
+        body = await self._read_json_body(request)
         feeds = self._load_feeds()
         if method == "POST":
-            url = (payload or {}).get("url", "").strip()
-            name = (payload or {}).get("name", "").strip()
-            group = (payload or {}).get("group", "").strip()
-            site_url = (payload or {}).get("site_url", "").strip()
+            url = str(body.get("url") or "").strip()
+            name = str(body.get("name") or "").strip()
+            group = str(body.get("group") or "").strip()
+            site_url = str(body.get("site_url") or "").strip()
             if not url:
                 return {"ok": False, "msg": "url 不能为空"}
             if any(f["url"] == url for f in feeds):
@@ -759,9 +942,14 @@ class RsshubReader(_PluginBase):
             self._refresh_one(url)
             return {"ok": True, "feeds": self._feeds_with_unread(feeds)}
         if method == "DELETE":
-            feeds = [f for f in feeds if f.get("url") != url]
+            # 删除：url 从请求体或 query 参数读取（DELETE 请求体可能被某些客户端丢弃）
+            del_url = str(body.get("url") or params.get("url") or "").strip()
+            if not del_url:
+                return {"ok": False, "msg": "缺少 url 参数"}
+            feeds = [f for f in feeds if f.get("url") != del_url]
             self._save_feeds(feeds)
-            self._articles.pop(url, None)
+            self._articles.pop(del_url, None)
+            self._save_cache(self._articles)
             return {"ok": True, "feeds": self._feeds_with_unread(feeds)}
         return {"ok": True, "feeds": self._feeds_with_unread(feeds)}
 
@@ -779,7 +967,7 @@ class RsshubReader(_PluginBase):
             out.append(item)
         return out
 
-    def api_articles(self, url: str = None, **_):
+    def api_articles(self, url: str = None) -> dict:
         """
         GET ?url=xxx 返回单源（每条文章附 is_read）；
         不带参数返回全部源的概览（含未读数）。
@@ -812,20 +1000,44 @@ class RsshubReader(_PluginBase):
             })
         return {"ok": True, "feeds": result}
 
-    def api_refresh(self, **_):
+    def api_refresh(self) -> dict:
+        """手动触发全量刷新（POST /refresh）。"""
         try:
             self.refresh_all()
             return {"ok": True, "msg": "刷新完成"}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    def api_proxy(self, url: str = None, **_):
+    def _is_allowed_proxy_url(self, url: str) -> bool:
+        """
+        图片代理白名单：仅允许当前文章缓存中出现过的图片地址。
+        防止 /proxy 被当作任意 URL 代理（SSRF/内网探测）。
+        """
+        self._maybe_load_cache()
+        allowed = set()
+        for data in self._articles.values():
+            for entry in data.get("entries", []):
+                thumb = entry.get("thumbnail") or ""
+                if thumb:
+                    allowed.add(thumb)
+                for img in (entry.get("images") or []):
+                    allowed.add(img)
+        return url in allowed
+
+    def api_proxy(self, url: str = None) -> "Response":
         """
         图片代理：前端 <img src="/api/v1/plugin/rsshub_reader/proxy?url=...">
-        由后端请求目标图片并流式返回，绕过防盗链与跨域。
+        由后端请求目标图片并返回，绕过防盗链与跨域。
+        仅代理缓存中出现过的图片地址（防 SSRF）；匿名可访问（供 <img> 直连）。
         """
         if not url:
-            return {"ok": False, "msg": "缺少 url 参数"}
+            return self._blank_pixel()
+        # 仅允许 http/https，且必须在缓存图片白名单内
+        if not url.lower().startswith(("http://", "https://")):
+            return self._blank_pixel()
+        if not self._is_allowed_proxy_url(url):
+            logger.warning(f"[{PLUGIN_NAME}] 代理请求被拒绝（不在缓存白名单内）: {url}")
+            return self._blank_pixel()
         try:
             r = _http_get(
                 url,
@@ -849,12 +1061,13 @@ class RsshubReader(_PluginBase):
             return self._blank_pixel()
 
     # ========== OPML 导出 ==========
-    def api_opml_export(self, **_):
+    def api_opml_export(self) -> dict:
         """
         将所有订阅源导出为 OPML 2.0 格式（text/xml）。
         兼容 Feedly / Inoreader / Miniflux / FreshRSS 等主流阅读器，
         导入时通过 <outline> 的 type="rss" xmlUrl 属性识别。
-        返回 FastAPI Response（附件下载）。
+        返回 JSON {filename, content}，由前端在浏览器侧生成下载文件
+        （避免二进制 Response 经鉴权/包装后无法触发下载）。
         """
         feeds = self._load_feeds()
         root = ET.Element("opml", version="2.0")
@@ -901,21 +1114,13 @@ class RsshubReader(_PluginBase):
         except Exception:
             pass
         tree.write(xml_bytes, encoding="UTF-8", xml_declaration=False)
-        content = xml_bytes.getvalue()
+        content = xml_bytes.getvalue().decode("utf-8")
 
         filename = f"rsshub_reader_{datetime.now().strftime('%Y%m%d_%H%M%S')}.opml"
-        from fastapi.responses import Response
-        return Response(
-            content=content,
-            media_type="text/xml; charset=utf-8",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Cache-Control": "no-store",
-            },
-        )
+        return {"ok": True, "filename": filename, "content": content}
 
     # ========== OPML 导入 ==========
-    def api_opml_import(self, payload: dict = None, **_):
+    async def api_opml_import(self, request: Request) -> dict:
         """
         解析 OPML（支持 1.0/1.1/2.0），提取所有 type="rss"/"atom" 的 outline，
         追加到本地订阅源（自动去重）。可选参数：
@@ -923,11 +1128,10 @@ class RsshubReader(_PluginBase):
           - url: 远程 OPML 文件地址（备用）
           - group: 强制归到指定分组（覆盖 OPML 内的 folder 结构）
         """
-        if not payload:
-            return {"ok": False, "msg": "缺少 payload"}
-        content = (payload or {}).get("content", "").strip()
-        remote_url = (payload or {}).get("url", "").strip()
-        force_group = (payload or {}).get("group", "").strip()
+        payload = await self._read_json_body(request)
+        content = str(payload.get("content") or "").strip()
+        remote_url = str(payload.get("url") or "").strip()
+        force_group = str(payload.get("group") or "").strip()
 
         if not content:
             if not remote_url:
@@ -947,7 +1151,7 @@ class RsshubReader(_PluginBase):
         # OPML: 订阅源在 root/body 下任意层级的 <outline type="rss|atom">
         feeds = self._load_feeds()
         existing_urls = {f["url"] for f in feeds}
-        default_group = force_group or self.get_config("opml_group", "导入")
+        default_group = force_group or self._cfg("opml_group", "导入")
 
         imported = []
         skipped = []
@@ -1010,9 +1214,10 @@ class RsshubReader(_PluginBase):
         walk(body)
 
         self._save_feeds(feeds)
-        # 导入后立刻拉取新源，让前端马上看到内容
-        for f in feeds[-len(imported):]:
-            self._refresh_one(f["url"])
+        # 导入后立刻拉取新源，让前端马上看到内容（无新增时跳过，避免误刷新全部）
+        if imported:
+            for f in feeds[-len(imported):]:
+                self._refresh_one(f["url"])
 
         return {
             "ok": True,
@@ -1022,18 +1227,22 @@ class RsshubReader(_PluginBase):
         }
 
     # ========== 已读标记：单条 ==========
-    def api_read(self, payload: dict = None, method: str = "POST", **_):
+    async def api_read(self, request: Request) -> dict:
         """
         POST：标记已读  {feed_url, entry_id, read: true}
-        DELETE：标记未读（改 status 参数或 DELETE 方法）  {feed_url, entry_id}
+        DELETE：标记未读  {feed_url, entry_id}
         若不传 entry_id 而只传 feed_url，则对该源全部文章生效。
         """
-        body = payload or {}
-        feed_url = (body.get("feed_url") or body.get("feedUrl") or "").strip()
-        entry_id = (body.get("entry_id") or body.get("entryId") or "").strip()
+        body = await self._read_json_body(request)
+        # 兼容前端 props.api.delete 不带 body 的情况：参数同时接受 query 兜底
+        params = dict(request.query_params)
+        feed_url = str(body.get("feed_url") or body.get("feedUrl")
+                       or params.get("feed_url") or params.get("feedUrl") or "").strip()
+        entry_id = str(body.get("entry_id") or body.get("entryId")
+                       or params.get("entry_id") or params.get("entryId") or "").strip()
         is_read = body.get("read", True)
         # DELETE 方法一律视为「标为未读」
-        if method == "DELETE":
+        if request.method == "DELETE":
             is_read = False
 
         if not feed_url:
@@ -1054,13 +1263,14 @@ class RsshubReader(_PluginBase):
             return self._mark_feed_read(feed_url, read=is_read)
 
     # ========== 已读标记：全部 ==========
-    def api_read_all(self, payload: dict = None, **_):
+    async def api_read_all(self, request: Request) -> dict:
         """
         POST {feed_url?: "..."}
         - 提供 feed_url：将该源所有文章标为已读
         - 不提供：将所有源标为已读
         """
-        feed_url = ((payload or {}).get("feed_url") or "").strip()
+        payload = await self._read_json_body(request)
+        feed_url = str(payload.get("feed_url") or "").strip()
         if feed_url:
             return self._mark_feed_read(feed_url, read=True)
         # 全部源
@@ -1146,6 +1356,23 @@ class RsshubReader(_PluginBase):
                 self._read_status.pop(key, None)
         self._save_read_status()
 
+    def _maybe_gc_notified(self):
+        """
+        通知去重记录（notified_entries.json）与已读记录一样会随文章过期而堆积：
+        清理那些当前缓存中已不存在的条目标记，防止文件无限增长。
+        """
+        if len(self._notified) < 2000:
+            return
+        self._maybe_load_cache()
+        valid = set()
+        for furl, data in self._articles.items():
+            for entry in data.get("entries", []):
+                valid.add(self._notified_key(furl, entry.get("id") or entry.get("link") or ""))
+        for key in list(self._notified.keys()):
+            if key not in valid:
+                self._notified.pop(key, None)
+        self._save_notified()
+
     # ==================================================================
     # 规则通知模块
     # ==================================================================
@@ -1186,7 +1413,8 @@ class RsshubReader(_PluginBase):
         return []
 
     # ---- 单条规则对单条 entry 的匹配 ----
-    def _rule_matches_entry(self, rule: dict, entry: dict, feed_url: str) -> bool:
+    def _rule_matches_entry(self, rule: dict, entry: dict, feed_url: str,
+                            ignore_read: bool = False) -> bool:
         """判断某 entry 是否命中某条规则（正向规则，OR 逻辑）。"""
         fields = [f for f in rule.get("fields", []) if f in self.VALID_FIELDS]
         if not fields:
@@ -1203,8 +1431,8 @@ class RsshubReader(_PluginBase):
         if "__all__" not in feed_urls and feed_url not in feed_urls:
             return False
 
-        # 已读条目不通知（需求 #7：与已读状态联动）
-        if self._is_read(feed_url, entry):
+        # 已读条目不通知（需求 #7：与已读状态联动）；规则测试时可通过 ignore_read 跳过
+        if not ignore_read and self._is_read(feed_url, entry):
             return False
 
         # 遍历字段 × 关键词：任一 (field, keyword) 命中即返回 True（OR）
@@ -1279,7 +1507,7 @@ class RsshubReader(_PluginBase):
 
                 # 命中：发送通知（逐条即时，需求 #5）
                 for rule in matched:
-                    self._send_notification(rule, entry, feed_name, feed_url)
+                    self._send_notification(rule, entry, feed_name)
                     self._notified[key] = {
                         "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "rule": rule.get("name", ""),
@@ -1290,28 +1518,29 @@ class RsshubReader(_PluginBase):
                     # 逐条即停：一条 entry 只对应一次通知，避免多规则重复骚扰
                     break
 
+        # 批量落盘：通知去重记录 + 已读状态（避免每条命中都触发一次磁盘 IO）
         self._save_notified()
+        self._save_read_status()
 
     def _notified_key(self, feed_url: str, entry_id) -> str:
         return f"{feed_url.rstrip('/')}::{str(entry_id).strip()}"
 
     def _mark_read(self, feed_url: str, entry):
-        """通知后标记已读（不触发额外 IO，仅更新内存 + 落盘）。"""
+        """通知后标记已读（仅更新内存；落盘由调用方批量完成，避免频繁 IO）。"""
         key = self._read_key(feed_url, entry.get("id") or entry.get("link"))
         if key not in self._read_status:
             self._read_status[key] = {
                 "read": True,
                 "read_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
-            self._save_read_status()
 
-    # ---- 发送通知：优先 MP MessageCenter，其次各渠道 ----
-    def _send_notification(self, rule: dict, entry: dict, feed_name: str, feed_url: str):
+    # ---- 发送通知：统一走 MP 通知组件（含站内消息中心），Webhook 走自定义通道 ----
+    def _send_notification(self, rule: dict, entry: dict, feed_name: str):
         title = entry.get("title", "") or "(无标题)"
         link = entry.get("link", "") or ""
         rule_name = rule.get("name", "")
-        channel = rule.get("channel") or self.get_config("notify_channel", "MessageCenter")
-        template = self.get_config(
+        channel = rule.get("channel") or self._cfg("notify_channel", "MessageCenter")
+        template = self._cfg(
             "notify_template",
             "📰 [{feed}] {title}\n命中规则：{rule}\n{link}",
         )
@@ -1320,32 +1549,14 @@ class RsshubReader(_PluginBase):
             published=entry.get("published", ""),
         )
         try:
-            # 1) 统一写入 MP 站内消息中心（任何渠道都会同时落一条）
-            self._push_message_center(title=f"[RSS阅读器] {rule_name}", text=text)
-        except Exception as e:
-            logger.warning(f"[{PLUGIN_NAME}] 站内消息写入失败: {e}")
-
-        # 2) 按渠道调用 MP 已配置的通知方式
-        try:
-            if channel == "MessageCenter":
-                pass  # 已写入站内消息中心
-            elif channel == "Telegram":
-                self._push_via_mp("telegram", title=title, text=text)
-            elif channel == "ServerChan":
-                self._push_via_mp("serverchan", title=title, text=text)
-            elif channel == "PushPlus":
-                self._push_via_mp("pushplus", title=title, text=text)
-            elif channel == "WeChatWork":
-                self._push_via_mp("wechatwork", title=title, text=text)
-            elif channel == "Webhook":
-                self._push_webhook(text=text, entry=entry, rule=rule, feed=feed_name)
+            self._push_notification(channel, title, text, link, entry, rule, feed_name)
             logger.info(
                 f"[{PLUGIN_NAME}] 规则通知 ✓ [{channel}] {rule_name}: {title}"
             )
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] 通知发送失败 [{channel}]: {e}")
 
-        # 3) 追加到通知记录（前端"最近通知记录"）
+        # 追加到通知记录（前端"最近通知记录"）
         self._append_notify_log({
             "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "rule": rule_name,
@@ -1355,52 +1566,27 @@ class RsshubReader(_PluginBase):
             "link": link,
         })
 
-    def _push_message_center(self, title: str, text: str):
+    def _push_notification(self, channel: str, title: str, text: str, link: str,
+                           entry: dict, rule: dict, feed_name: str):
         """
-        写入 MP 站内消息中心。
-        优先使用 MessageCenterHelper（MP 推荐），失败时降级为 schemas.Notification。
+        按渠道发送通知。
+        Webhook 走自定义 POST；其余渠道映射到 MP 的 MessageChannel，
+        通过基类 post_message 发送（channel=None 表示 MP 默认分发，含站内消息中心）。
         """
-        try:
-            from app.helper import MessageCenterHelper
-            MessageCenterHelper.put(msg=text, title=title, role="plugin")
-        except Exception:
-            # 降级：通过 Notification 表
-            try:
-                from app.schemas import NotificationType
-                from app.db import db
-                from app.models import Notification
-                with db.context() as session:
-                    session.add(Notification(
-                        title=title,
-                        text=text,
-                        type=NotificationType.Info,
-                    ))
-            except Exception as e:
-                logger.debug(f"[{PLUGIN_NAME}] 降级通知也失败: {e}")
-
-    def _push_via_mp(self, channel_key: str, title: str, text: str):
-        """
-        调用 MP 已配置的通知渠道。
-        MP 通过 SystemConfig 管理各渠道，插件不直接持有客户端；
-        这里通过 MessageCenterHelper 的统一入口发送（其内部会按启用渠道分发）。
-        若运行环境版本不支持，则仅记录日志（不影响站内消息）。
-        """
-        try:
-            from app.helper import MessageCenterHelper
-            # send_message 会按 MP 全局配置的实际渠道（Telegram/ServerChan 等）分发
-            if hasattr(MessageCenterHelper, "send_message"):
-                MessageCenterHelper.send_message(
-                    title=title, text=text, channel=channel_key,
-                )
-            else:
-                # 无 send_message 时退化为 put（仅站内）
-                MessageCenterHelper.put(msg=text, title=title, role="plugin")
-        except Exception as e:
-            logger.debug(f"[{PLUGIN_NAME}] {channel_key} 分发跳过: {e}")
+        if channel == "Webhook":
+            self._push_webhook(text=text, entry=entry, rule=rule, feed=feed_name)
+            return
+        self.post_message(
+            channel=self._CHANNEL_MAP.get(channel),
+            mtype=NotificationType.Plugin,
+            title=title,
+            text=text,
+            link=link or None,
+        )
 
     def _push_webhook(self, text: str, entry: dict, rule: dict, feed: str):
         """Webhook 渠道：POST JSON 到配置的地址。"""
-        webhook_url = self.get_config("webhook_url", "") or ""
+        webhook_url = self._cfg("webhook_url", "") or ""
         if not webhook_url:
             logger.debug(f"[{PLUGIN_NAME}] Webhook 未配置 webhook_url，跳过")
             return
@@ -1417,7 +1603,7 @@ class RsshubReader(_PluginBase):
         _http_post_json(webhook_url, payload)
 
     def _append_notify_log(self, record: dict):
-        max_log = int(self.get_config("max_notify_log", 200))
+        max_log = int(self._cfg("max_notify_log", 200))
         log = self._load_notify_log()
         log.insert(0, record)
         if len(log) > max_log:
@@ -1425,14 +1611,17 @@ class RsshubReader(_PluginBase):
         self._save_notify_log(log)
 
     # ================= 规则 API =================
-    def api_rules(self, url: str = None, method: str = "GET", payload: dict = None, **_):
+    async def api_rules(self, request: Request) -> dict:
         """
         GET：规则列表（附命中预览统计）
         POST：新建规则
         DELETE ?id=xxx：删除规则
         """
+        method = request.method
+        params = dict(request.query_params)
+        body = await self._read_json_body(request)
         if method == "POST":
-            rule, err = self._validate_rule(payload or {})
+            rule, err = self._validate_rule(body)
             if err:
                 return {"ok": False, "msg": err}
             rule["id"] = rule.get("id") or f"r_{int(time.time()*1000)}"
@@ -1442,7 +1631,7 @@ class RsshubReader(_PluginBase):
             self._save_rules()
             return {"ok": True, "rules": self._rules_with_stats()}
         if method == "DELETE":
-            rule_id = (url or "").strip() or ((payload or {}).get("id") or "").strip()
+            rule_id = str(params.get("id") or body.get("id") or "").strip()
             if not rule_id:
                 return {"ok": False, "msg": "缺少规则 id"}
             before = len(self._rules)
@@ -1504,12 +1693,13 @@ class RsshubReader(_PluginBase):
         return out
 
     # ---- 规则测试（不发送通知，仅返回匹配结果）----
-    def api_rules_test(self, payload: dict = None, **_):
+    async def api_rules_test(self, request: Request) -> dict:
         """
         对当前缓存的所有文章试运行规则，返回命中的条目（不发送通知、不写记录）。
         用法：前端"测试规则"按钮 → POST { fields, match_type, keywords, feed_urls }
         """
-        draft, err = self._validate_rule(payload or {})
+        body = await self._read_json_body(request)
+        draft, err = self._validate_rule(body)
         if err:
             return {"ok": False, "msg": err}
         self._maybe_load_cache()
@@ -1518,7 +1708,7 @@ class RsshubReader(_PluginBase):
             feed_name = data.get("title", "") or feed_url
             for entry in data.get("entries", []):
                 # 测试时不过滤已读/已通知，方便用户看到全量命中
-                if self._rule_matches_entry(draft, entry, feed_url):
+                if self._rule_matches_entry(draft, entry, feed_url, ignore_read=True):
                     hits.append({
                         "feed": feed_name,
                         "title": entry.get("title", ""),
@@ -1533,9 +1723,9 @@ class RsshubReader(_PluginBase):
         }
 
     # ================= 通知记录 API =================
-    def api_notify_log(self, method: str = "GET", **_):
+    async def api_notify_log(self, request: Request) -> dict:
         """GET：最近通知记录；DELETE：清空记录。"""
-        if method == "DELETE":
+        if request.method == "DELETE":
             self._save_notify_log([])
             return {"ok": True, "msg": "已清空通知记录"}
         log = self._load_notify_log()
@@ -1587,35 +1777,28 @@ class RsshubReader(_PluginBase):
         except Exception as e:
             logger.debug(f"[{PLUGIN_NAME}] 通知记录写入失败: {e}")
 
-    # ================= 前端页面（Vuetify JSON） =================
-    def get_page(self) -> dict:
+    # ================= 前端页面（Vue 全页，模块联邦） =================
+    @staticmethod
+    def get_render_mode() -> tuple:
         """
-        在 MP 导航中注册一个页面。Vue SFC 源码放在同目录 page.vue，
-        运行时由 MP 挂载到主界面（通过 PluginAPI 调用上面注册的 API）。
-
-        页面包含：
-          - 订阅源管理（添加/删除/OPML 导入导出）
-          - 文章列表（已读/未读状态、未读数角标）
-          - 图片画廊（点开文章看全部图片，走代理）
-          - 已读标记（打开自动标已读、单条切换、全部标已读）
-          - 通知规则（CRUD、字段/匹配方式/关键词/渠道配置、测试、最近通知记录）
+        渲染模式：vue 全页。
+        第二项为构建产物目录（相对插件目录），前端由 MP 远程组件机制加载 dist/assets/remoteEntry.js。
         """
-        return {
-            "name": "RSS 阅读器",
-            "icon": "mdi-rss",
-            "path": "/rsshub-reader",
-            "component": self._load_vue(),
-        }
+        return "vue", "dist/assets"
 
-    def _load_vue(self) -> str:
-        """读取同目录 page.vue，避免 Python 字符串里花括号/引号冲突。"""
-        vue_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "page.vue")
-        try:
-            with open(vue_path, "r", encoding="utf-8") as f:
-                return f.read()
-        except Exception as e:
-            logger.error(f"[{PLUGIN_NAME}] 读取 page.vue 失败: {e}")
-            return "<template><div>页面加载失败</div></template>"
+    def get_sidebar_nav(self) -> list:
+        """在 MP 侧边栏注册页面入口（nav_key 固定 main，前端只暴露 ./AppPage 即可匹配）。"""
+        return [
+            {
+                "nav_key": "main",
+                "name": "RSS 阅读器",
+                "icon": "mdi-rss",
+            }
+        ]
+
+    def get_page(self):
+        """vue 全页模式：不返回 vuetify 详情页配置。"""
+        return None
 
     # ================= 内部：数据存取 =================
     def _load_feeds(self) -> list:
@@ -1648,8 +1831,8 @@ class RsshubReader(_PluginBase):
 
     def _refresh_one(self, feed_url: str):
         try:
-            fetch_full = bool(self.get_config("fetch_full", True))
-            max_entries = int(self.get_config("max_entries", 50))
+            fetch_full = bool(self._cfg("fetch_full", True))
+            max_entries = int(self._cfg("max_entries", 50))
             data = parse_feed(feed_url, fetch_full=fetch_full)
             data["entries"] = data["entries"][:max_entries]
             self._articles[feed_url] = data
@@ -1666,10 +1849,14 @@ class RsshubReader(_PluginBase):
         )
         return Response(content=gif, media_type="image/gif")
 
-    def get_config(self, key: str, default=None):
-        """读取当前插件配置（由 MP 配置表单持久化）。"""
+    def _cfg(self, key: str, default=None):
+        """
+        读取当前插件配置。
+        优先取 init_plugin 最近一次生效的运行态配置（self._config），
+        再回退到基类 get_config()（MP 持久化的配置），避免首次加载未落盘时读到空。
+        """
         try:
-            config = self.config or {}
+            config = getattr(self, "_config", None) or self.get_config() or {}
             return config.get(key, default)
         except Exception:
             return default
