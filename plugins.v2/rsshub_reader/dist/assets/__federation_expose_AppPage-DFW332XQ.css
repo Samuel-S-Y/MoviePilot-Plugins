@@ -1,0 +1,134 @@
+
+/* 订阅源条目：整块可点，高度 ≥48px 以保证移动端触控命中率 */
+.feed-item[data-v-11836c69] {
+  min-height: 48px;
+  cursor: pointer;
+}
+/* 移动端：本组件内部的图标按钮同样需要达到 44px 触控目标
+   （AppPage 的媒体查询作用不到子组件内部元素） */
+@media (max-width: 959px) {
+.feed-item[data-v-11836c69] .v-btn {
+    min-width: 44px;
+    min-height: 44px;
+}
+}
+
+.two-line[data-v-ca1b8d98] {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.clamp-2[data-v-ca1b8d98] {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* 单列列表：去掉 grid 的行列内边距，卡片间距只由 mb-3 控制，避免上下间距不均 */
+.entry-list[data-v-ca1b8d98] {
+  margin: 0;
+}
+.entry-list > .v-col[data-v-ca1b8d98] {
+  padding: 0;
+}
+/* 中栏文章卡片：明确的白底 + 细边框，与页面背景区分开；hover 时边框转主题色并轻微抬升 */
+.entry-card[data-v-ca1b8d98] {
+  background: rgb(var(--v-theme-surface));
+  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.entry-card[data-v-ca1b8d98]:hover {
+  border-color: rgb(var(--v-theme-primary));
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+/* 已读：只弱化文字、保留卡片形态，避免整块变灰显得脏 */
+.entry-card.is-read[data-v-ca1b8d98] {
+  background: rgba(var(--v-theme-on-surface), 0.02);
+}
+.entry-card.is-read .v-card-title[data-v-ca1b8d98],
+.entry-card.is-read .v-card-text[data-v-ca1b8d98] {
+  opacity: 0.7;
+}
+/* 中栏当前选中的文章：左侧高亮条 + 淡色底，与右栏内容对应 */
+.entry-card.is-active[data-v-ca1b8d98] {
+  border-left: 3px solid rgb(var(--v-theme-primary));
+  background: rgba(var(--v-theme-primary), 0.06);
+}
+/* 收紧卡片内部留白：中栏卡片是列表项，不需要 Vuetify 默认的大间距 */
+.entry-card .v-card-title[data-v-ca1b8d98] {
+  padding: 12px 12px 2px;
+  font-size: 0.875rem;
+  line-height: 1.4;
+}
+.entry-card .v-card-subtitle[data-v-ca1b8d98] {
+  padding: 0 12px;
+  font-size: 0.7rem;
+  opacity: 0.7;
+}
+.entry-card .v-card-text[data-v-ca1b8d98] {
+  padding: 6px 12px 0;
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+.entry-card .v-card-actions[data-v-ca1b8d98] {
+  padding: 2px 8px 6px;
+  min-block-size: auto;
+}
+
+/* ============ 移动端适配（<960px，对应 Vuetify smAndDown）============ */
+@media (max-width: 959px) {
+  /* 可点元素最小 44×44px：符合触控目标尺寸建议，降低误触
+     （加 .app-page 前缀是为了让构建的自定义过滤插件保留该规则） */
+.app-page .v-btn[data-v-ca1b8d98] {
+    min-height: 44px;
+}
+.app-page .v-btn--icon[data-v-ca1b8d98] {
+    min-width: 44px;
+}
+  /* 正文 16px / 行距 1.75：移动阅读更舒适，同时避免 iOS 聚焦时自动放大 */
+  /* 用 .app-page 提升特异性，确保覆盖文末的桌面基线字号 */
+.app-page .article-content[data-v-ca1b8d98] {
+    font-size: 16px;
+    line-height: 1.75;
+}
+  /* v-html 渲染的正文内容不携带 scope 属性，需用 :deep 才能命中内部 img */
+.article-content[data-v-ca1b8d98] img {
+    max-width: 100%;
+    height: auto;
+}
+  /* 中栏卡片在窄屏放大字号，提升可读性 */
+.entry-card .v-card-title[data-v-ca1b8d98] {
+    font-size: 1rem;
+}
+.entry-card .v-card-text[data-v-ca1b8d98] {
+    font-size: 0.875rem;
+}
+}
+/* 中栏卡片左侧小缩略图：固定方形不参与伸缩，圆角与卡片留白协调 */
+.entry-thumb[data-v-ca1b8d98] {
+  flex: 0 0 auto;
+  margin: 12px 0 0 12px;
+  border-radius: 6px;
+}
+.article-content[data-v-ca1b8d98] {
+  max-width: 820px;
+  margin: 0 auto;
+  line-height: 1.8;
+  font-size: 15px;
+}
+.article-content[data-v-ca1b8d98] img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 12px auto;
+  border-radius: 4px;
+}
+.article-content[data-v-ca1b8d98] a {
+  color: var(--v-theme-primary);
+}
+.article-content[data-v-ca1b8d98] blockquote {
+  border-left: 4px solid #ccc;
+  padding-left: 12px;
+  color: #666;
+}

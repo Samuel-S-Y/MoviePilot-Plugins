@@ -24,8 +24,10 @@ import re
 import json
 import time
 import hashlib
+import ipaddress
+import threading
 from datetime import datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin, unquote, urlparse
 from xml.etree import ElementTree as ET
 
 # ---- 依赖采用「可用即用、缺失降级」策略 ----
@@ -116,6 +118,14 @@ except ImportError:  # pragma: no cover - 本地测试桩
     Request = None
     Response = None
 
+# 线程池执行器：async 端点里调用的抓取/通知都是同步阻塞 IO，
+# 用 await run_in_threadpool(...) 执行可避免阻塞事件循环；无 fastapi 时降级为直接调用
+try:
+    from fastapi.concurrency import run_in_threadpool
+except ImportError:  # pragma: no cover - 本地测试桩
+    async def run_in_threadpool(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
 
 # ---------- 常量 ----------
 PLUGIN_NAME = "rsshub_reader"
@@ -125,7 +135,53 @@ USER_AGENT = (
 REQUEST_TIMEOUT = 20
 # 单次抓取正文时最多提取的图片数，避免超长页面拖慢
 MAX_IMAGES_PER_ENTRY = 30
-# 允许通过代理返回的 Content-Type 白名单
+# 正文纯文本短于此长度即视为「RSS 摘要」，阅读时按需去抓原网页正文
+SUMMARY_MAX_CHARS = 200
+# 正文提取算法版本号：算法升级（如选择器/装饰图过滤变更）时 +1，
+# 让缓存里的旧提取结果自动失效并重新抓取，避免用户升级后仍看到旧数据
+CONTENT_VER = 2
+# 通知测试（试运行并真实发送）时最多发送的样例条数，避免命中过多造成刷屏
+NOTIFY_TEST_SAMPLE = 3
+# 单次 OPML 导入的最大订阅源数：导入后会逐个抓取，条数过多会长时间占用线程池与事件循环
+MAX_OPML_FEEDS = 200
+# 额外的「不可路由」网段：ipaddress 已覆盖 RFC1918/回环/链路本地/保留地址，
+# 但运营商级 NAT（100.64.0.0/10）与基准测试网段（198.18.0.0/15）不在 is_private 之内，
+# 需单独判定，否则图片代理可被用来探测这类内网地址
+EXTRA_PRIVATE_NETS = ("100.64.0.0/10", "198.18.0.0/15")
+# 正文容器候选选择器（按优先级）：覆盖主流论坛与 CMS，命中后只保留正文部分，
+# 避免抓不到正文容器时回退整页、把站点 logo/横幅等装饰图误当成文章图片
+CONTENT_SELECTORS = (
+    # 论坛：Flarum / Discuz / phpBB / vBulletin / XenForo
+    ".Post-body", ".postbody", ".postmessage", ".post_message", ".t_f",
+    ".bbWrapper", ".message-body", ".messageContent",
+    # CMS / 博客 / 公众号
+    "article", ".post-content", ".entry-content", ".article-content",
+    ".rich_media_content", ".markdown-body",
+    # 通用兜底
+    "main", "[role=main]", ".content", "#content",
+)
+# 正文去噪：先删掉的标签级噪声
+NOISE_TAGS = ("script", "style", "noscript", "nav", "header", "footer",
+              "form", "iframe", "aside")
+# 正文去噪：站点装饰区块（logo/导航/侧栏/广告等），其中的图片不属于文章内容；
+# [aria-hidden=true] 是无障碍语义上的「纯装饰」，常被用于 IDE 皮肤、图标墙等视觉噪声
+NOISE_SELECTORS = (
+    ".Logo", ".logo", ".site-logo", ".App-header", ".site-header", ".site-footer",
+    ".navbar", ".nav-bar", ".sidebar", ".breadcrumb", ".pagination",
+    ".ad", ".ads", ".advertisement", ".banner", ".share", ".social",
+    "[aria-hidden='true']",
+)
+# 图片 URL 命中这些关键词即视为站点图标/装饰图（logo、头像、徽章、表情等），不计入文章图片
+SKIP_IMAGE_KEYWORDS = (
+    "avatar", "placeholder", "pixel.", "1x1.", "blank.gif", "spacer",
+    "logo", "sprite", "favicon", "emoji", "smiley", "banner", "watermark",
+    "icon", "badge", "/static/image/common", "/static/image/smiley",
+)
+# 声明尺寸（width/height 属性或 CSS 尺寸类）不超过该像素值的图片，视为图标类装饰图
+ICON_MAX_SIZE_PX = 64
+# 无 BeautifulSoup 降级解析时，这些标签内的图片一律视为站点装饰图（页眉 logo/导航/页脚）
+NOISE_CONTAINER_TAGS = ("header", "footer", "nav", "aside")
+# 允许通过代理返回的 Content-Type 白名单（不含 svg：SVG 可携带脚本，代理场景直接拒绝）
 ALLOWED_IMAGE_TYPES = {
     "image/jpeg": ".jpg",
     "image/jpg": ".jpg",
@@ -133,7 +189,6 @@ ALLOWED_IMAGE_TYPES = {
     "image/gif": ".gif",
     "image/webp": ".webp",
     "image/avif": ".avif",
-    "image/svg+xml": ".svg",
     "image/bmp": ".bmp",
 }
 
@@ -166,6 +221,103 @@ def _absolutize(base: str, url: str) -> str:
         return urljoin(base, url)
     except Exception:
         return url
+
+
+def _best_from_srcset(srcset: str) -> str:
+    """
+    从 srcset 中取「分辨率最高」的候选地址（描述符 w/x 越大越清晰）。
+    取第一个通常是缩略图，会导致正文配图模糊。
+    """
+    best, best_score = "", -1.0
+    for part in (srcset or "").split(","):
+        bits = part.strip().split()
+        if not bits:
+            continue
+        score = 0.0
+        if len(bits) > 1:
+            try:
+                score = float(bits[1].lower().rstrip("wx"))
+            except ValueError:
+                score = 0.0
+        if score > best_score:
+            best, best_score = bits[0], score
+    return best
+
+
+def _is_private_host(host: str) -> bool:
+    """
+    判断主机是否指向内网/保留地址，用于阻止图片代理被当成内网探测工具。
+    只做字面量与常见保留名的判断，不做 DNS 解析（避免引入额外延迟与解析抖动）。
+    """
+    h = (host or "").strip().strip("[]").lower()
+    if not h:
+        return True
+    if h == "localhost" or h.endswith(".local") or h.endswith(".internal"):
+        return True
+    # 交给标准库 ipaddress 解析：它同时覆盖 IPv6、IPv4-mapped IPv6（::ffff:127.0.0.1）
+    # 与各种保留网段属性；此前只做点分十进制正则，下列形式都能绕过内网判断
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        # 纯整数/十六进制形式（inet_aton 风格，如 2130706433、0x7f000001）ipaddress 不接受，
+        # 用 int(h, 0) 再转一次；失败说明是域名等合法输入，交由上层域名白名单处理，不抛异常
+        try:
+            ip = ipaddress.ip_address(int(h, 0))
+        except (ValueError, TypeError):
+            return False
+    # IPv4-mapped IPv6 需按内嵌的 IPv4 判断（旧版本 Python 的 is_private 不识别映射地址）
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_unspecified):
+        return True
+    # is_private 未覆盖的运营商级 NAT / 基准测试网段
+    if ip.version == 4:
+        for net in EXTRA_PRIVATE_NETS:
+            try:
+                if ip in ipaddress.ip_network(net):
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def _looks_like_site_icon(url: str, attrs: dict = None) -> bool:
+    """
+    判断一张图片是否属于「站点装饰图/图标」（logo、头像、徽章、表情、导航图标等）。
+
+    依据两类信号（任一命中即判定为装饰图），两类都不依赖 BeautifulSoup，
+    因此有/无 bs4 的解析路径都能生效：
+      1) URL 关键词：logo、avatar、icon、badge、emoji、sprite 等；
+         先做 URL 解码，兼容 Next.js 等站点的 /_next/image?url=%2Fbee%2F... 形式；
+      2) 声明尺寸过小：width/height 属性或 CSS 尺寸类（如 h-8、max-w-[76px]）
+         换算后不超过 ICON_MAX_SIZE_PX，这类基本是图标而非文章配图。
+    """
+    probe = unquote(url or "").lower()
+    if any(k in probe for k in SKIP_IMAGE_KEYWORDS):
+        return True
+    if not attrs:
+        return False
+    # 显式的 width/height 属性
+    try:
+        w = int(str(attrs.get("width") or 0).strip() or 0)
+        h = int(str(attrs.get("height") or 0).strip() or 0)
+        if w and h and w <= ICON_MAX_SIZE_PX and h <= ICON_MAX_SIZE_PX:
+            return True
+    except (TypeError, ValueError):
+        pass
+    # CSS 尺寸类：Tailwind 的 1 单位 = 4px（h-8 → 32px），以及 max-w-[76px] 这类任意值
+    cls = str(attrs.get("class") or "")
+    for m in re.finditer(r"(?:^|\s)[hw]-(\d+(?:\.\d+)?)(?=\s|$)", cls):
+        try:
+            if float(m.group(1)) * 4 <= ICON_MAX_SIZE_PX:
+                return True
+        except ValueError:
+            continue
+    for m in re.finditer(r"max-(?:w|h)-\[(\d+)px\]", cls):
+        if int(m.group(1)) <= ICON_MAX_SIZE_PX:
+            return True
+    return False
 
 
 def extract_images_from_html(html: str, base_url: str) -> list:
@@ -203,7 +355,10 @@ def _extract_images_bs4(html: str, base_url: str) -> list:
                 candidates.append(v)
         srcset = img.get("srcset")
         if srcset:
-            candidates.append(srcset.split(",")[0].strip().split(" ")[0])
+            # 取分辨率最高的候选，避免用了 srcset 里的缩略图
+            best_src = _best_from_srcset(srcset)
+            if best_src:
+                candidates.append(best_src)
         src = img.get("src")
         if src:
             candidates.append(src)
@@ -212,8 +367,14 @@ def _extract_images_bs4(html: str, base_url: str) -> list:
             abs_url = _absolutize(base_url, c)
             if not abs_url or abs_url in seen:
                 continue
-            low = abs_url.lower()
-            if any(k in low for k in ("avatar", "placeholder", "pixel.", "1x1.", "blank.gif")):
+            # 站点装饰图（logo/头像/徽章/表情/小图标）不计入文章图片
+            # bs4 的 class 属性是 list，需先扁平化为字符串，
+            # 否则尺寸类（如 h-8）的正则匹配失效，装饰图过滤会被削弱
+            flat_attrs = {
+                k: (" ".join(v) if isinstance(v, (list, tuple)) else v)
+                for k, v in img.attrs.items()
+            }
+            if _looks_like_site_icon(abs_url, flat_attrs):
                 continue
             seen.add(abs_url)
             result.append(abs_url)
@@ -223,32 +384,48 @@ def _extract_images_bs4(html: str, base_url: str) -> list:
 
 
 def _extract_images_stdlib(html: str, base_url: str) -> list:
-    """无 bs4 时的降级实现（标准库 HTMLParser）。"""
+    """
+    无 bs4 时的降级实现（标准库 HTMLParser）。
+    会跳过 header/footer/nav/aside 内的图片，避免把站点页眉 logo、导航图标当成文章图片。
+    """
     from html.parser import HTMLParser
 
     class ImgParser(HTMLParser):
         def __init__(self):
             super().__init__()
             self.urls = []
+            self._noise_depth = 0  # >0 表示正处于站点装饰区块内部
 
         def handle_starttag(self, tag, attrs):
-            if tag != "img":
+            if tag in NOISE_CONTAINER_TAGS:
+                self._noise_depth += 1
+                return
+            if tag != "img" or self._noise_depth:
                 # 也可处理 <source srcset>，这里聚焦 img
                 return
             d = dict(attrs)
             cands = []
             for attr in ("data-src", "data-original", "data-url", "data-large"):
-                if attr in d and d[attr]:
+                if d.get(attr):
                     cands.append(d[attr])
-            if "src" in d and d["src"]:
+            if d.get("srcset"):
+                # 与 bs4 路径保持一致：取 srcset 中分辨率最高的候选
+                best_src = _best_from_srcset(d["srcset"])
+                if best_src:
+                    cands.append(best_src)
+            if d.get("src"):
                 cands.append(d["src"])
             for c in cands:
                 # 保留完整 URL（含 query）：部分 CDN 图片地址带签名参数，截断会导致 403
                 u = _absolutize(base_url, c)
                 if u and u not in self.urls:
-                    low = u.lower()
-                    if not any(k in low for k in ("avatar", "placeholder", "pixel.", "1x1.", "blank.gif")):
+                    # 站点装饰图（logo/头像/徽章/表情/小图标）不计入文章图片
+                    if not _looks_like_site_icon(u, d):
                         self.urls.append(u)
+
+        def handle_endtag(self, tag):
+            if tag in NOISE_CONTAINER_TAGS and self._noise_depth:
+                self._noise_depth -= 1
 
     p = ImgParser()
     try:
@@ -270,6 +447,164 @@ def _strip_tags(html: str) -> str:
     # 降级：简单正则去标签
     import re as _re
     return _re.sub(r"<[^>]+>", "", html)
+
+
+def _clean_article_html(html: str, base_url: str) -> str:
+    """
+    把抓取到的网页 HTML 清洗成可读的文章正文：
+      1) 删除脚本、导航、页眉页脚、侧栏、广告等小区块（避免站点装饰图混入文章图片）；
+      2) 按优先级定位正文容器（覆盖 Flarum/Discuz 等论坛与常见 CMS），只保留正文；
+      3) 把 img 的相对地址转成绝对地址，避免前端 v-html 渲染时按主程序域名解析而 404。
+    无 BeautifulSoup 时降级为「正则提取文本最长的候选容器 + 剔除页眉页脚」。
+    """
+    if not html:
+        return html
+    if not HAVE_BS4:
+        # 降级（无 bs4）：先删脚本/样式——Next.js 等站点会把 RSC 数据内联在 <script> 里，
+        # 不删会串进正文并干扰「最长容器」的判断；再取候选容器中文本最长的一段作为正文，
+        # 最后剔除页眉/页脚/导航/侧栏等噪声区块
+        body = html
+        for tag in ("script", "style", "noscript"):
+            body = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", "", body, flags=re.S | re.I)
+        best, best_len = "", 0
+        for tag in ("article", "main", "section"):
+            for m in re.finditer(rf"<{tag}\b[^>]*>(.*?)</{tag}>", body, re.S | re.I):
+                seg = m.group(1)
+                length = len(re.sub(r"<[^>]+>", "", seg))
+                if length > best_len:
+                    best, best_len = seg, length
+        body = best or body
+        for tag in NOISE_CONTAINER_TAGS:
+            body = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}>", "", body, flags=re.S | re.I)
+        # 安全清洗（降级路径同样必须做）：去掉内联事件属性与 javascript: 协议，
+        # 否则前端 v-html 渲染时会执行脚本
+        body = re.sub(r'\son[a-z]+\s*=\s*"[^"]*"', "", body, flags=re.I)
+        body = re.sub(r"\son[a-z]+\s*=\s*'[^']*'", "", body, flags=re.I)
+        # 无引号的内联事件属性（onerror=alert(1)）：属性值一直延伸到空白或 > 为止，
+        # 此前只清理带引号形式，无引号写法同样会在 v-html 渲染时执行脚本
+        body = re.sub(r"\son[a-z]+\s*=\s*[^\s>]+", "", body, flags=re.I)
+        # 原生懒加载（降级路径）：负向前瞻避免重复注入已有 loading 的标签
+        body = re.sub(
+            r"<img\b(?![^>]*\sloading=)",
+            '<img loading="lazy" decoding="async"',
+            body,
+            flags=re.I,
+        )
+        body = re.sub(
+            r"""\s(?:href|src|data-src|data-original|srcset)\s*=\s*(?:"\s*(?:javascript|vbscript|data:text/html)[^"]*"|'\s*(?:javascript|vbscript|data:text/html)[^']*'|(?:javascript|vbscript):[^\s>]*)""",
+            "",
+            body,
+            flags=re.I,
+        )
+        # 相对地址绝对化：降级路径此前缺少这一步，会让相对路径的图片/链接
+        # 被前端按宿主域名解析而 404
+        body = re.sub(
+            r'(src|href)="(/[^"]*)"',
+            lambda m: f'{m.group(1)}="{urljoin(base_url, m.group(2))}"',
+            body,
+            flags=re.I,
+        )
+        return body
+    try:
+        soup = _BeautifulSoup(html, "html.parser")
+    except Exception as e:
+        logger.debug(f"[{PLUGIN_NAME}] 正文解析失败: {e}")
+        return html
+    # 标签级去噪
+    for tag in soup(list(NOISE_TAGS)):
+        tag.decompose()
+    # 区块级去噪：站点 logo/导航/侧栏/广告等容器整体删除
+    for selector in NOISE_SELECTORS:
+        for el in soup.select(selector):
+            el.decompose()
+    # 在候选容器中取「文本最长」的一个作为正文：正文内容最多，
+    # 可自动排除 AI 助手气泡、相关推荐、侧栏等同样命中选择器的小块
+    node = None
+    best_len = 0
+    for selector in CONTENT_SELECTORS:
+        for candidate in soup.select(selector):
+            length = len(candidate.get_text(strip=True))
+            if length > best_len:
+                node, best_len = candidate, length
+    node = node or soup.body or soup
+    # 图片地址绝对化（含懒加载属性），否则相对路径在前端无法加载
+    for img in node.find_all("img"):
+        src = img.get("src")
+        if src:
+            img["src"] = _absolutize(base_url, src)
+        for attr in ("data-src", "data-original"):
+            val = img.get(attr)
+            if val:
+                img[attr] = _absolutize(base_url, val)
+        # srcset 同样要绝对化：浏览器会优先按 srcset 选图，
+        # 保留相对路径会让正文配图按宿主域名解析而 404
+        srcset = img.get("srcset")
+        if srcset:
+            img["srcset"] = ", ".join(
+                " ".join([_absolutize(base_url, p.strip().split()[0])] + p.strip().split()[1:])
+                for p in srcset.split(",")
+                if p.strip()
+            )
+        # 原生懒加载：正文可能很长、图片很多，按需加载可显著降低首屏开销（移动端收益更明显）
+        img["loading"] = "lazy"
+        img["decoding"] = "async"
+    # 正文内链接同样绝对化，避免点击后跳到主程序域名下的无效地址
+    for a in node.find_all("a"):
+        href = a.get("href")
+        if href:
+            a["href"] = _absolutize(base_url, href)
+    # 安全清洗：前端用 v-html 渲染正文，必须去掉可执行内容——
+    # 内联事件属性（onerror/onload/onclick…）与 javascript: 协议链接都会导致脚本执行
+    for el in node.find_all(True):
+        for attr in list(el.attrs):
+            if attr.lower().startswith("on"):
+                del el.attrs[attr]
+        for attr in ("href", "src", "data-src", "data-original", "srcset"):
+            val = el.get(attr)
+            if isinstance(val, str) and val.strip().lower().startswith(
+                ("javascript:", "vbscript:", "data:text/html")
+            ):
+                del el.attrs[attr]
+    return str(node)
+
+
+def _load_json_dict(path: str, label: str) -> dict:
+    """
+    读取「字典结构」的 JSON 状态文件（已读状态 / 通知去重记录）。
+    文件被写坏成数组或字符串时，后续 self._x[key] = ... 会抛 TypeError 让接口 500、
+    定时任务中断；这里统一做类型校验，异常时按空字典处理并告警。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning(f"[{PLUGIN_NAME}] {label} 读取失败，按空处理: {e}")
+        return {}
+    if not isinstance(data, dict):
+        logger.warning(f"[{PLUGIN_NAME}] {label} 结构异常（不是对象），已忽略")
+        return {}
+    return data
+
+
+def _load_json_list(path: str, label: str) -> list:
+    """
+    读取「列表结构」的 JSON 状态文件（订阅源 / 规则 / 通知记录）。
+    与 _load_json_dict 同样的类型校验目的。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        logger.warning(f"[{PLUGIN_NAME}] {label} 读取失败，按空处理: {e}")
+        return []
+    if not isinstance(data, list):
+        logger.warning(f"[{PLUGIN_NAME}] {label} 结构异常（不是数组），已忽略")
+        return []
+    return data
 
 
 def _http_get(url: str, extra_headers: dict = None) -> "requests.Response":
@@ -306,13 +641,21 @@ def _http_post_json(url: str, payload: dict):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
     if HAVE_REQUESTS:
-        _requests.post(url, data=body, headers=headers, timeout=REQUEST_TIMEOUT)
+        r = _requests.post(url, data=body, headers=headers, timeout=REQUEST_TIMEOUT)
+        # requests 对 4xx/5xx 不抛异常，不校验会被当成发送成功：该条目随即登记去重记录、
+        # 永久不再通知。这里显式抛错，让调用方走「失败不登记」的分支
+        r.raise_for_status()
         return
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError, URLError
     req = Request(url, data=body, headers=headers, method="POST")
     try:
-        urlopen(req, timeout=REQUEST_TIMEOUT).read()
+        resp = urlopen(req, timeout=REQUEST_TIMEOUT)
+        resp.read()
+        # 与 requests 分支语义保持一致：状态码 >=400 同样视为发送失败
+        status = getattr(resp, "status", None) or 0
+        if status >= 400:
+            raise RuntimeError(f"Webhook 返回状态码 {status}")
     except (HTTPError, URLError) as e:
         raise RuntimeError(f"Webhook 请求失败: {e}")
 
@@ -366,7 +709,7 @@ def _parse_feed_feedparser(content: bytes, fetch_full: bool) -> dict:
             try:
                 r = _http_get(link, {"Accept-Language": "zh-CN,zh;q=0.9"})
                 r.raise_for_status()
-                content_html = r.text
+                content_html = _clean_article_html(r.text, link)
             except Exception as ex:
                 logger.debug(f"[{PLUGIN_NAME}] 抓取正文失败 {link}: {ex}")
         body_images = extract_images_from_html(content_html, link)
@@ -439,7 +782,7 @@ def _parse_feed_stdlib(content: bytes, fetch_full: bool) -> dict:
             try:
                 r = _http_get(link, {"Accept-Language": "zh-CN,zh;q=0.9"})
                 r.raise_for_status()
-                content_html = r.text
+                content_html = _clean_article_html(r.text, link)
             except Exception as ex:
                 logger.debug(f"[{PLUGIN_NAME}] 抓取正文失败 {link}: {ex}")
 
@@ -477,10 +820,12 @@ class RsshubReader(_PluginBase):
     """RSSHub 资讯源阅读器插件。"""
 
     # ---- 插件元信息（MP 后台“插件市场”展示用）----
-    plugin_name = PLUGIN_NAME
+    # plugin_name 是展示名，需与市场索引 package.v2.json 的 name 保持一致；
+    # PLUGIN_NAME 常量仅作日志前缀，保持与插件目录一致的英文标识。
+    plugin_name = "RSSHub 阅读器"
     plugin_desc = "RSSHub 资讯源阅读器：订阅管理（OPML导入导出）、阅读文章、完整图片、已读标记、规则通知（含后端图片代理）"
-    plugin_version = "1.3.0"
-    plugin_author = "your-name"
+    plugin_version = "1.6.2"
+    plugin_author = "Samuel"
 
     # ---- 通知渠道映射：规则 channel → MP 消息渠道（None 表示走 MP 默认分发）----
     _CHANNEL_MAP = {
@@ -504,6 +849,12 @@ class RsshubReader(_PluginBase):
     # 已读状态（内存缓存，结构：{entry_key: {"read": True, "read_at": "..."}}）
     # entry_key 用 "feed_url::entry_id" 拼接，id 缺失时回退到 link
     _read_status: dict = {}
+    # 规则列表与通知去重记录：实际内容在 init_plugin 中从磁盘载入，
+    # 这里给出类级默认值，保证实例尚未初始化时读取也不会 AttributeError
+    _rules: list = None
+    _notified: dict = None
+    # 保护 _articles「写内存 + 落盘」的可重入锁（实例级，由 _get_cache_lock 惰性创建）
+    _cache_lock = None
 
     # ================= 生命周期 =================
     def init_plugin(self, config: dict = None):
@@ -512,6 +863,10 @@ class RsshubReader(_PluginBase):
         幂等：重载时不重复初始化内存状态（_initialized 守护）。
         """
         self._config = config or {}
+        # 并发写保护：定时刷新线程与 API 线程会并发改 _articles 并落盘，
+        # 用同一把可重入锁串行化「写内存 + 落盘」；惰性创建保证 MP 多次调用 init_plugin
+        # 时复用同一把锁（重建会让旧引用失去保护，等于没有加锁）
+        self._get_cache_lock()
         if getattr(self, "_initialized", False):
             return
         # 数据目录由 MP 基类提供（插件数据根目录下）
@@ -522,13 +877,18 @@ class RsshubReader(_PluginBase):
         self._read_file = os.path.join(self._data_dir, "read_status.json")
         self._rules_file = os.path.join(self._data_dir, "notify_rules.json")
         self._notified_file = os.path.join(self._data_dir, "notified_entries.json")
-        # 内存状态（首次启动时为空；已在 refresh_all 中惰性恢复缓存）
-        self._articles = getattr(self, "_articles", {})
+        # 内存状态（首次启动为空字典，内容由 _maybe_load_cache 从磁盘惰性恢复）。
+        # 注意：必须绑定实例级字典，不能沿用类属性的 {}——类属性是可变对象，
+        # 会被同一插件的多个实例（如插件分身）共享，导致订阅源数据互相污染。
+        if "_articles" not in self.__dict__:
+            self._articles = {}
         self._read_status = self._load_read_status()
         self._rules = self._load_rules()
         self._notified = self._load_notified()
         self._initialized = True
-        logger.info(f"[{PLUGIN_NAME}] 数据目录: {self._data_dir}")
+        logger.info(
+            f"[{PLUGIN_NAME}] v{self.plugin_version} 已加载，数据目录: {self._data_dir}"
+        )
 
     def get_state(self) -> bool:
         """插件启用状态（配置表单 enabled 开关）。"""
@@ -756,7 +1116,7 @@ class RsshubReader(_PluginBase):
         """
         if not self.get_state():
             return []
-        interval = max(5, int(self._cfg("poll_interval", 30)))
+        interval = max(5, self._cfg_int("poll_interval", 30))
         return [{
             "id": "rsshub_reader_refresh",
             "name": "RSS 源定时刷新",
@@ -775,7 +1135,7 @@ class RsshubReader(_PluginBase):
             logger.debug(f"[{PLUGIN_NAME}] 暂无订阅源，跳过刷新")
             return
 
-        max_entries = int(self._cfg("max_entries", 50))
+        max_entries = self._cfg_int("max_entries", 50)
         fetch_full = bool(self._cfg("fetch_full", True))
 
         articles = {}
@@ -798,14 +1158,21 @@ class RsshubReader(_PluginBase):
                 if url in self._articles:
                     articles[url] = self._articles[url]
 
-        self._articles = articles
-        self._save_cache(articles)
+        # 只在「替换内存态 + 落盘」这一小段加锁：上面的 HTTP 抓取绝不能进锁，
+        # 否则并发刷新/单源刷新会被串行化，抓取反而更慢
+        with self._get_cache_lock():
+            self._articles = articles
+            self._save_cache(articles)
         # 刷新后清理失效的已读/已通知记录（惰性，仅在记录量大时真正执行）
         self._maybe_gc_read_status()
         self._maybe_gc_notified()
         # 规则通知：仅对新出现的条目进行匹配（去重 + 已读联动在 match 内部处理）
         if bool(self._cfg("notify_enabled", True)):
-            self._process_notify(articles)
+            # 通知属附加能力：其异常不应影响刷新主流程与已写入的缓存结果
+            try:
+                self._process_notify(articles)
+            except Exception as e:
+                logger.error(f"[{PLUGIN_NAME}] 规则通知流程异常: {e}")
 
     # ================= 自定义 API =================
     def get_api(self) -> list:
@@ -845,6 +1212,13 @@ class RsshubReader(_PluginBase):
                 "methods": ["GET"],
                 "allow_anonymous": True,
                 "summary": "图片代理（仅允许缓存中的图片地址，防 SSRF）",
+            },
+            {
+                "path": "/article/content",
+                "endpoint": self.api_article_content,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "按需抓取单篇文章完整正文（列表刷新时不抓，避免拖慢）",
             },
             # ---- OPML 导入/导出 ----
             {
@@ -901,7 +1275,7 @@ class RsshubReader(_PluginBase):
         ]
 
     @staticmethod
-    async def _read_json_body(request) -> dict:
+    async def _read_json_body(request: Request) -> dict:
         """
         读取请求体 JSON（FastAPI Request 注入）。
         无 body / 非 JSON 时返回空字典，避免接口因缺 body 直接 422。
@@ -912,15 +1286,21 @@ class RsshubReader(_PluginBase):
             return {}
 
     # ---- API 实现 ----
-    async def api_feeds(self, request) -> dict:
+    async def api_feeds(self, request: Request) -> dict:
         """
         GET 列表（附分组、未读数）/ POST 添加 / DELETE 删除。
         添加时支持 group 字段，便于 OPML 导入与前端分组管理。
+
+        注意：request 必须标注为 fastapi.Request，否则 FastAPI 会把它当成
+        必填的 query 参数，导致 /feeds 全部请求在进入本方法前就返回 422。
         """
         method = request.method
         params = dict(request.query_params)
         body = await self._read_json_body(request)
         feeds = self._load_feeds()
+        # 先恢复磁盘缓存：否则进程刚启动还没刷新过时，下面的 _save_cache 会把
+        # 只有内存态的空字典写回磁盘，导致已缓存的文章数据被清空
+        self._maybe_load_cache()
         if method == "POST":
             url = str(body.get("url") or "").strip()
             name = str(body.get("name") or "").strip()
@@ -938,8 +1318,8 @@ class RsshubReader(_PluginBase):
                 "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
             self._save_feeds(feeds)
-            # 添加后立刻拉一次
-            self._refresh_one(url)
+            # 添加后立刻拉一次（同步抓取放进线程池，避免阻塞事件循环）
+            await run_in_threadpool(self._refresh_one, url)
             return {"ok": True, "feeds": self._feeds_with_unread(feeds)}
         if method == "DELETE":
             # 删除：url 从请求体或 query 参数读取（DELETE 请求体可能被某些客户端丢弃）
@@ -1008,9 +1388,96 @@ class RsshubReader(_PluginBase):
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
+    def api_article_content(self, feed_url: str = None, entry_id: str = None,
+                            force: bool = False) -> dict:
+        """
+        按需抓取单篇文章的完整正文（GET ?feed_url=&entry_id=[&force=1]）。
+
+        为什么放在阅读时抓、而不是刷新时抓：一个源动辄几十条，刷新时逐条抓网页
+        会让刷新耗时被放大数十倍；改为点开文章时再抓，抓到的正文与图片回写缓存，
+        同一篇再次打开直接命中缓存不再请求原站（force=1 可强制重抓）。
+
+        图片以「正文容器内提取到的」为准：RSS 与整页 HTML 常混入站点 logo、横幅、
+        表情等装饰图，此前合并旧图片会把它们一并展示出来。
+        """
+        feed_url = str(feed_url or "").strip()
+        entry_id = str(entry_id or "").strip()
+        if not feed_url or not entry_id:
+            return {"ok": False, "msg": "缺少 feed_url 或 entry_id"}
+        self._maybe_load_cache()
+        data = self._articles.get(feed_url) or {}
+        target = None
+        for entry in data.get("entries", []):
+            if str(entry.get("id") or entry.get("link")) == entry_id:
+                target = entry
+                break
+        if not target:
+            return {"ok": False, "msg": "未找到该文章（可先刷新订阅源）"}
+        # 已抓取过且提取算法版本一致时直接返回缓存，避免每次打开都请求原站；
+        # 提取逻辑升级（CONTENT_VER 变化）会让旧缓存自动失效并重新抓取
+        if (
+            target.get("content_fetched")
+            and not force
+            and target.get("content_ver") == CONTENT_VER
+        ):
+            return {
+                "ok": True,
+                "cached": True,
+                "content": target.get("content", ""),
+                "images": target.get("images") or [],
+            }
+        link = str(target.get("link") or "").strip()
+        if not link:
+            return {"ok": False, "msg": "该文章没有原文链接"}
+        # 抓取原文并清洗为可读正文（去噪 + 图片绝对化）
+        try:
+            r = _http_get(link, {"Accept-Language": "zh-CN,zh;q=0.9"})
+            r.raise_for_status()
+            content_html = _clean_article_html(r.text, link)
+        except Exception as e:
+            logger.error(f"[{PLUGIN_NAME}] 按需抓取正文失败 {link}: {e}")
+            return {"ok": False, "msg": f"抓取正文失败：{e}"}
+        body_images = extract_images_from_html(content_html, link)[:MAX_IMAGES_PER_ENTRY]
+        # 抓到的内容过于空（通常是反爬验证页或需登录页）时明确告知用户而不是显示空白，
+        # 此时不写缓存、也不改动内存态，便于站点恢复后再次尝试
+        if len(_strip_tags(content_html)) < 20 and not body_images:
+            logger.warning(f"[{PLUGIN_NAME}] 未提取到有效正文（可能被反爬拦截或需登录）: {link}")
+            return {
+                "ok": False,
+                "msg": "未能从原文提取到有效正文（该站点可能需要登录或存在反爬限制）",
+            }
+        # 抓取期间可能发生了整体刷新（refresh_all 会替换整个 _articles），
+        # 因此「重新定位 + 回写 + 落盘」必须在缓存锁内一次完成：
+        # 否则会写到已脱离字典的旧对象上，接口返回成功但缓存实际没生效
+        with self._get_cache_lock():
+            latest = self._articles.get(feed_url) or {}
+            target = None
+            for entry in latest.get("entries", []):
+                if str(entry.get("id") or entry.get("link")) == entry_id:
+                    target = entry
+                    break
+            if target is None:
+                # 条目已被刷新移除：不写入、不落盘，明确告知用户重试（此前会假成功）
+                logger.warning(
+                    f"[{PLUGIN_NAME}] 正文回写失败：条目已不在缓存中 {feed_url}::{entry_id}"
+                )
+                return {"ok": False, "msg": "文章已被刷新或移除，请刷新订阅源后重试"}
+            # 回写缓存：正文 + 以正文内图片为准重建列表（丢弃 RSS/整页里的装饰图）
+            target["content"] = content_html
+            target["content_fetched"] = True
+            target["content_ver"] = CONTENT_VER
+            target["images"] = body_images
+            target["thumbnail"] = body_images[0] if body_images else ""
+            self._save_cache(self._articles)
+        logger.info(
+            f"[{PLUGIN_NAME}] 按需抓取正文成功 [{target.get('title')}] "
+            f"{len(content_html)} 字符 / {len(body_images)} 张图"
+        )
+        return {"ok": True, "content": content_html, "images": body_images}
+
     def _is_allowed_proxy_url(self, url: str) -> bool:
         """
-        图片代理白名单：仅允许当前文章缓存中出现过的图片地址。
+        图片代理白名单：仅允许插件缓存中出现过的图片地址。
         防止 /proxy 被当作任意 URL 代理（SSRF/内网探测）。
         """
         self._maybe_load_cache()
@@ -1022,7 +1489,15 @@ class RsshubReader(_PluginBase):
                     allowed.add(thumb)
                 for img in (entry.get("images") or []):
                     allowed.add(img)
-        return url in allowed
+        if url in allowed:
+            return True
+        # 未命中时再检查正文 HTML：前端会把正文里的所有 <img> 都改写为代理地址，
+        # 若只放行 images 列表，超出 30 张上限或被装饰图规则过滤掉的正文配图会变成空白像素
+        for data in self._articles.values():
+            for entry in data.get("entries", []):
+                if url in (entry.get("content") or ""):
+                    return True
+        return False
 
     def api_proxy(self, url: str = None) -> "Response":
         """
@@ -1035,6 +1510,10 @@ class RsshubReader(_PluginBase):
         # 仅允许 http/https，且必须在缓存图片白名单内
         if not url.lower().startswith(("http://", "https://")):
             return self._blank_pixel()
+        # 拒绝内网/保留地址：避免 /proxy 被当作内网探测工具（SSRF 面收敛）
+        if _is_private_host(urlparse(url).hostname or ""):
+            logger.warning(f"[{PLUGIN_NAME}] 代理请求被拒绝（内网/保留地址）: {url}")
+            return self._blank_pixel()
         if not self._is_allowed_proxy_url(url):
             logger.warning(f"[{PLUGIN_NAME}] 代理请求被拒绝（不在缓存白名单内）: {url}")
             return self._blank_pixel()
@@ -1045,6 +1524,10 @@ class RsshubReader(_PluginBase):
             )
             r.raise_for_status()
             ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            # SVG 可携带脚本，代理场景直接拒绝，避免 MIME 嗅探带来的脚本执行面
+            if "svg" in ctype:
+                logger.warning(f"[{PLUGIN_NAME}] 代理请求被拒绝（SVG 类型）: {url}")
+                return self._blank_pixel()
             if ctype not in ALLOWED_IMAGE_TYPES:
                 # 不认识的也放行（有些 CDN 返回 application/octet-stream），前端自行处理
                 ctype = "image/jpeg"
@@ -1137,7 +1620,9 @@ class RsshubReader(_PluginBase):
             if not remote_url:
                 return {"ok": False, "msg": "请提供 OPML 内容（content）或远程地址（url）"}
             try:
-                r = _http_get(remote_url)
+                # 远程下载是同步阻塞 IO（最长 REQUEST_TIMEOUT），必须放进线程池，
+                # 否则会阻塞事件循环、拖慢整个 MP 后端
+                r = await run_in_threadpool(_http_get, remote_url)
                 r.raise_for_status()
                 content = r.text
             except Exception as e:
@@ -1150,6 +1635,8 @@ class RsshubReader(_PluginBase):
 
         # OPML: 订阅源在 root/body 下任意层级的 <outline type="rss|atom">
         feeds = self._load_feeds()
+        # 记录导入前的条数：超上限截断时据此回退 feeds，只保留前 MAX_OPML_FEEDS 个新增源
+        base_count = len(feeds)
         existing_urls = {f["url"] for f in feeds}
         default_group = force_group or self._cfg("opml_group", "导入")
 
@@ -1213,17 +1700,32 @@ class RsshubReader(_PluginBase):
             return {"ok": False, "msg": "OPML 缺少 <body> 节点"}
         walk(body)
 
+        # 单次导入条数上限：下面的逐源抓取是同步 IO，导入几百个源会长时间占用线程池
+        # 并让本次请求迟迟不返回；超出部分直接截断（feeds 同步回退，不落盘多余数据）
+        truncated = len(imported) > MAX_OPML_FEEDS
+        if truncated:
+            logger.warning(
+                f"[{PLUGIN_NAME}] OPML 共解析出 {len(imported)} 个源，"
+                f"超出单次导入上限 {MAX_OPML_FEEDS}，已截断"
+            )
+            feeds = feeds[:base_count + MAX_OPML_FEEDS]
+            imported = imported[:MAX_OPML_FEEDS]
+
         self._save_feeds(feeds)
         # 导入后立刻拉取新源，让前端马上看到内容（无新增时跳过，避免误刷新全部）
         if imported:
             for f in feeds[-len(imported):]:
-                self._refresh_one(f["url"])
+                # 逐个放进线程池执行，避免连续同步抓取阻塞事件循环
+                await run_in_threadpool(self._refresh_one, f["url"])
 
+        msg = f"成功导入 {len(imported)} 个，跳过 {len(skipped)} 个已存在源"
+        if truncated:
+            msg += f"（单次最多导入 {MAX_OPML_FEEDS} 个，超出部分已截断）"
         return {
             "ok": True,
             "imported": imported,
             "skipped": skipped,
-            "msg": f"成功导入 {len(imported)} 个，跳过 {len(skipped)} 个已存在源",
+            "msg": msg,
         }
 
     # ========== 已读标记：单条 ==========
@@ -1326,11 +1828,7 @@ class RsshubReader(_PluginBase):
         return bool(self._read_status.get(key, {}).get("read"))
 
     def _load_read_status(self) -> dict:
-        try:
-            with open(self._read_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        return _load_json_dict(self._read_file, "已读状态")
 
     def _save_read_status(self):
         try:
@@ -1341,8 +1839,9 @@ class RsshubReader(_PluginBase):
 
     def _maybe_gc_read_status(self):
         """
-        已读记录可能随文章过期而堆积。当记录数超过文章总数一定倍数时，
-        清理那些在当前缓存里已找不到对应文章的状态（惰性 GC，避免频繁 IO）。
+        已读记录会随文章过期而不断堆积。
+        记录数达到阈值（2000）后，清理当前缓存中已找不到对应文章的条目，
+        采用惰性 GC 以避免每次刷新都做全量比对与磁盘写入。
         """
         if len(self._read_status) < 2000:
             return
@@ -1361,7 +1860,7 @@ class RsshubReader(_PluginBase):
         通知去重记录（notified_entries.json）与已读记录一样会随文章过期而堆积：
         清理那些当前缓存中已不存在的条目标记，防止文件无限增长。
         """
-        if len(self._notified) < 2000:
+        if not self._notified or len(self._notified) < 2000:
             return
         self._maybe_load_cache()
         valid = set()
@@ -1467,7 +1966,8 @@ class RsshubReader(_PluginBase):
     def _matched_rules(self, entry: dict, feed_url: str) -> list:
         """返回命中的规则列表（按优先级/顺序）。"""
         result = []
-        for rule in self._rules:
+        # 兜底：_rules 类级默认值为 None，未初始化时遍历会 TypeError
+        for rule in (self._rules or []):
             if not rule.get("enabled", True):
                 continue
             if self._rule_matches_entry(rule, entry, feed_url):
@@ -1484,6 +1984,9 @@ class RsshubReader(_PluginBase):
         """
         if not self._rules:
             return
+        # 兜底：类级默认值是 None，未初始化时下面的成员判断与赋值会 TypeError
+        if not isinstance(self._notified, dict):
+            self._notified = self._load_notified() or {}
         # 上一次缓存（用于判断"新条目"）；首次运行时 _articles 已是全量，仅首条不重复通知
         for feed_url, data in articles.items():
             feed_name = data.get("title", "") or feed_url
@@ -1507,7 +2010,10 @@ class RsshubReader(_PluginBase):
 
                 # 命中：发送通知（逐条即时，需求 #5）
                 for rule in matched:
-                    self._send_notification(rule, entry, feed_name)
+                    if not self._send_notification(rule, entry, feed_name):
+                        # 发送失败（渠道不可用等）：不登记去重记录、不标已读，下次刷新会重试；
+                        # 若还有其他规则命中则继续尝试下一个渠道
+                        continue
                     self._notified[key] = {
                         "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "rule": rule.get("name", ""),
@@ -1535,7 +2041,12 @@ class RsshubReader(_PluginBase):
             }
 
     # ---- 发送通知：统一走 MP 通知组件（含站内消息中心），Webhook 走自定义通道 ----
-    def _send_notification(self, rule: dict, entry: dict, feed_name: str):
+    def _send_notification(self, rule: dict, entry: dict, feed_name: str) -> bool:
+        """
+        发送一条规则通知，返回是否发送成功。
+        调用方据此决定要不要登记去重记录：发送失败绝不能登记，
+        否则该条目会被永久跳过、之后再也不会重试。
+        """
         title = entry.get("title", "") or "(无标题)"
         link = entry.get("link", "") or ""
         rule_name = rule.get("name", "")
@@ -1544,17 +2055,25 @@ class RsshubReader(_PluginBase):
             "notify_template",
             "📰 [{feed}] {title}\n命中规则：{rule}\n{link}",
         )
-        text = template.format(
-            feed=feed_name, title=title, link=link, rule=rule_name,
-            published=entry.get("published", ""),
-        )
+        try:
+            text = template.format(
+                feed=feed_name, title=title, link=link, rule=rule_name,
+                published=entry.get("published", ""),
+            )
+        except (KeyError, IndexError, ValueError) as e:
+            # 自定义模板可能写错占位符（未知变量或裸花括号），降级为默认模板，
+            # 避免模板异常让通知乃至整个刷新流程中断
+            logger.warning(f"[{PLUGIN_NAME}] 通知模板变量无效({e})，已回退默认模板")
+            text = f"📰 [{feed_name}] {title}\n命中规则：{rule_name}\n{link}"
         try:
             self._push_notification(channel, title, text, link, entry, rule, feed_name)
             logger.info(
                 f"[{PLUGIN_NAME}] 规则通知 ✓ [{channel}] {rule_name}: {title}"
             )
+            sent = True
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] 通知发送失败 [{channel}]: {e}")
+            sent = False
 
         # 追加到通知记录（前端"最近通知记录"）
         self._append_notify_log({
@@ -1564,7 +2083,11 @@ class RsshubReader(_PluginBase):
             "feed": feed_name,
             "title": title,
             "link": link,
+            # 记录里区分成功/失败：失败的只是「尝试记录」，
+            # 若前端不区分会把实际未发出的条目展示成已通知
+            "sent": sent,
         })
+        return sent
 
     def _push_notification(self, channel: str, title: str, text: str, link: str,
                            entry: dict, rule: dict, feed_name: str):
@@ -1588,8 +2111,9 @@ class RsshubReader(_PluginBase):
         """Webhook 渠道：POST JSON 到配置的地址。"""
         webhook_url = self._cfg("webhook_url", "") or ""
         if not webhook_url:
-            logger.debug(f"[{PLUGIN_NAME}] Webhook 未配置 webhook_url，跳过")
-            return
+            # 抛错而非静默返回：否则调用方会当作发送成功并登记去重记录，
+            # 该条目将永久不再通知（用户以为通知生效、实际从未发出）
+            raise ValueError("Webhook 未配置 webhook_url")
         payload = {
             "plugin": PLUGIN_NAME,
             "rule": rule.get("name"),
@@ -1603,7 +2127,7 @@ class RsshubReader(_PluginBase):
         _http_post_json(webhook_url, payload)
 
     def _append_notify_log(self, record: dict):
-        max_log = int(self._cfg("max_notify_log", 200))
+        max_log = self._cfg_int("max_notify_log", 200)
         log = self._load_notify_log()
         log.insert(0, record)
         if len(log) > max_log:
@@ -1620,14 +2144,30 @@ class RsshubReader(_PluginBase):
         method = request.method
         params = dict(request.query_params)
         body = await self._read_json_body(request)
+        # 兜底：类级默认值是 None，若本方法在 init_plugin 之前被调用，
+        # 下面的 len()/append() 会抛 TypeError 造成 500，这里惰性载入为列表
+        if not isinstance(self._rules, list):
+            self._rules = self._load_rules() or []
         if method == "POST":
             rule, err = self._validate_rule(body)
             if err:
                 return {"ok": False, "msg": err}
-            rule["id"] = rule.get("id") or f"r_{int(time.time()*1000)}"
+            # _validate_rule 只产出业务字段，id 由前端在「编辑」「切换启用」时回传，
+            # 必须从原始请求体取，否则会把编辑误判为新增、产生重复规则
+            rule["id"] = str(body.get("id") or "").strip() or f"r_{int(time.time() * 1000)}"
             rule.setdefault("enabled", True)
             rule.setdefault("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            self._rules.append(rule)
+            # 同 id 已存在则覆盖更新，否则追加为新建
+            index = next(
+                (i for i, r in enumerate(self._rules) if r.get("id") == rule["id"]),
+                None,
+            )
+            if index is None:
+                self._rules.append(rule)
+            else:
+                # 保留原创建时间，便于前端区分「新建」与「修改」
+                rule["created_at"] = self._rules[index].get("created_at") or rule["created_at"]
+                self._rules[index] = rule
             self._save_rules()
             return {"ok": True, "rules": self._rules_with_stats()}
         if method == "DELETE":
@@ -1682,28 +2222,41 @@ class RsshubReader(_PluginBase):
         log = self._load_notify_log()
         last_hit = {}
         for rec in log:
+            # 失败记录（sent=False）只是「尝试记录」，不算命中：
+            # 否则前端会把实际未发出的条目展示成已通知
+            if rec.get("sent") is False:
+                continue
             name = rec.get("rule")
             if name and name not in last_hit:
                 last_hit[name] = rec.get("at")
         out = []
-        for r in self._rules:
+        # 兜底：_rules 类级默认值为 None，未初始化时遍历会 TypeError
+        for r in (self._rules or []):
             item = dict(r)
             item["last_hit"] = last_hit.get(r.get("name"), "")
             out.append(item)
         return out
 
-    # ---- 规则测试（不发送通知，仅返回匹配结果）----
+    # ---- 规则测试：默认只预览；带 notify=true 时真实走一遍通知流程 ----
     async def api_rules_test(self, request: Request) -> dict:
         """
-        对当前缓存的所有文章试运行规则，返回命中的条目（不发送通知、不写记录）。
-        用法：前端"测试规则"按钮 → POST { fields, match_type, keywords, feed_urls }
+        对当前缓存的所有文章试运行规则。
+
+        - 不带 notify：只返回命中条目，不发送通知、不写记录；
+        - 带 notify=true（前端「通知测试」按钮）：命中条目中最多取前 NOTIFY_TEST_SAMPLE 条
+          真实发送通知，用于验证通知渠道配置是否正确。为保证测试不污染正式流程，
+          不写通知去重记录、也不标记已读。
+        用法：POST { fields, match_type, keywords, feed_urls, [notify] }
         """
         body = await self._read_json_body(request)
         draft, err = self._validate_rule(body)
         if err:
             return {"ok": False, "msg": err}
+        send_notify = bool(body.get("notify"))
         self._maybe_load_cache()
         hits = []
+        sent = 0
+        failed = 0
         for feed_url, data in self._articles.items():
             feed_name = data.get("title", "") or feed_url
             for entry in data.get("entries", []):
@@ -1715,11 +2268,35 @@ class RsshubReader(_PluginBase):
                         "link": entry.get("link", ""),
                         "published": entry.get("published", ""),
                     })
+                    # 通知测试：只发前若干条样例，命中过多时不刷屏；
+                    # 次数按「尝试数」而非「成功数」计，否则失败时会一直重试到超出样例上限
+                    if send_notify and (sent + failed) < NOTIFY_TEST_SAMPLE:
+                        # 发送是同步 IO，放进线程池避免阻塞事件循环
+                        ok = await run_in_threadpool(
+                            self._send_notification, draft, entry, feed_name
+                        )
+                        # 按返回值分别统计：此前忽略返回值直接累加 sent，
+                        # 会把发送失败也算成「已发送 N 条」，掩盖渠道配置错误
+                        if ok:
+                            sent += 1
+                        else:
+                            failed += 1
+        if send_notify:
+            tail = (f"（仅发送前 {NOTIFY_TEST_SAMPLE} 条样例）"
+                    if len(hits) > sent + failed else "")
+            msg = f"通知测试完成：命中 {len(hits)} 条，发送成功 {sent} 条"
+            if failed:
+                msg += f"，发送失败 {failed} 条（请检查通知渠道与 Webhook 配置）"
+            msg += tail
+        else:
+            msg = f"试运行完成，共命中 {len(hits)} 条（仅展示前 50 条）"
         return {
             "ok": True,
             "matched": len(hits),
+            "sent": sent,
+            "failed": failed,
             "hits": hits[:50],  # 最多返回 50 条预览
-            "msg": f"试运行完成，共命中 {len(hits)} 条（仅展示前 50 条）",
+            "msg": msg,
         }
 
     # ================= 通知记录 API =================
@@ -1733,22 +2310,18 @@ class RsshubReader(_PluginBase):
 
     # ================= 规则持久化 =================
     def _load_rules(self) -> list:
-        try:
-            with open(self._rules_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
+        return _load_json_list(self._rules_file, "通知规则")
 
     def _save_rules(self):
-        with open(self._rules_file, "w", encoding="utf-8") as f:
-            json.dump(self._rules, f, ensure_ascii=False, indent=2)
+        try:
+            with open(self._rules_file, "w", encoding="utf-8") as f:
+                json.dump(self._rules, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            # 同上：写入失败（磁盘满/权限）不应让规则相关接口 500 或中断调用方
+            logger.error(f"[{PLUGIN_NAME}] 通知规则写入失败: {e}")
 
     def _load_notified(self) -> dict:
-        try:
-            with open(self._notified_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        return _load_json_dict(self._notified_file, "通知去重记录")
 
     def _save_notified(self):
         try:
@@ -1758,14 +2331,11 @@ class RsshubReader(_PluginBase):
             logger.debug(f"[{PLUGIN_NAME}] 通知去重记录写入失败: {e}")
 
     def _load_notify_log(self) -> list:
-        notify_log_file = os.path.join(self._data_dir or "", "notify_log.json")
         if not self._data_dir:
             return []
-        try:
-            with open(notify_log_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
+        return _load_json_list(
+            os.path.join(self._data_dir, "notify_log.json"), "通知记录"
+        )
 
     def _save_notify_log(self, log: list):
         if not self._data_dir:
@@ -1787,12 +2357,21 @@ class RsshubReader(_PluginBase):
         return "vue", "dist/assets"
 
     def get_sidebar_nav(self) -> list:
-        """在 MP 侧边栏注册页面入口（nav_key 固定 main，前端只暴露 ./AppPage 即可匹配）。"""
+        """
+        在 MP 侧边栏注册页面入口。
+        - title：侧栏显示文案（字段名必须为 title，写成 name 会被忽略并回退成插件 ID）；
+        - section=organize：归入「整理」分组，即内建「站点刷流」所在分组；
+        - order=100：同组内靠后排序，展示在「站点刷流」下方；
+        - nav_key 固定 main，前端暴露 ./AppPage 即可匹配。
+        """
         return [
             {
                 "nav_key": "main",
-                "name": "RSS 阅读器",
+                # 侧栏文案单独取值（比市场展示名「RSSHub 阅读器」更短，与内建项长度协调）
+                "title": "RSS阅读器",
                 "icon": "mdi-rss",
+                "section": "organize",
+                "order": 100,
             }
         ]
 
@@ -1802,15 +2381,34 @@ class RsshubReader(_PluginBase):
 
     # ================= 内部：数据存取 =================
     def _load_feeds(self) -> list:
+        """
+        读取订阅源列表。
+        顺手过滤掉结构异常的条目（非字典、缺 url），避免后续取 url 时抛 KeyError 导致 500。
+        """
         try:
             with open(self._feeds_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except Exception:
             return []
+        if not isinstance(data, list):
+            logger.warning(f"[{PLUGIN_NAME}] feeds.json 结构异常（不是数组），已忽略")
+            return []
+        feeds = []
+        for item in data:
+            if isinstance(item, dict) and str(item.get("url") or "").strip():
+                feeds.append(item)
+            else:
+                logger.warning(f"[{PLUGIN_NAME}] 跳过结构异常的订阅源条目: {str(item)[:80]}")
+        return feeds
 
     def _save_feeds(self, feeds: list):
-        with open(self._feeds_file, "w", encoding="utf-8") as f:
-            json.dump(feeds, f, ensure_ascii=False, indent=2)
+        try:
+            with open(self._feeds_file, "w", encoding="utf-8") as f:
+                json.dump(feeds, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            # 磁盘满/权限不足时不能把异常抛给调用方：API 会 500、定时任务会中断，
+            # 而内存态仍然有效，只记录错误即可
+            logger.error(f"[{PLUGIN_NAME}] 订阅源写入失败: {e}")
 
     def _save_cache(self, articles: dict):
         try:
@@ -1819,24 +2417,61 @@ class RsshubReader(_PluginBase):
         except Exception as e:
             logger.debug(f"[{PLUGIN_NAME}] 缓存写入失败: {e}")
 
+    def _get_cache_lock(self) -> "threading.RLock":
+        """
+        取实例级缓存锁（惰性创建）。
+        必须是每实例各自的锁：类级共享锁会让插件分身互相阻塞；
+        惰性创建则兼容 init_plugin 尚未调用就触达内部方法的场景。
+        """
+        lock = getattr(self, "_cache_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._cache_lock = lock
+        return lock
+
     def _maybe_load_cache(self):
         """启动时若内存为空，先从磁盘缓存恢复（避免重启后页面空白）。"""
         if self._articles:
             return
         try:
             with open(self._cache_file, "r", encoding="utf-8") as f:
-                self._articles = json.load(f)
+                data = json.load(f)
         except Exception:
             self._articles = {}
+            return
+        # 类型校验：articles.json 被写坏（顶层成了数组、某个 value 不是 dict）时，
+        # 后续 data.get(...) 会抛 AttributeError 让接口 500，这里直接判为无效缓存
+        if not isinstance(data, dict):
+            logger.warning(f"[{PLUGIN_NAME}] articles.json 结构异常（顶层不是对象），已忽略")
+            self._articles = {}
+            return
+        cache = {}
+        for url, value in data.items():
+            if not isinstance(value, dict):
+                logger.warning(f"[{PLUGIN_NAME}] 跳过结构异常的缓存项: {str(url)[:80]}")
+                continue
+            # entries 非列表时归一为空列表，避免遍历时抛 TypeError
+            if not isinstance(value.get("entries"), list):
+                value = dict(value, entries=[])
+            cache[url] = value
+        self._articles = cache
 
     def _refresh_one(self, feed_url: str):
         try:
             fetch_full = bool(self._cfg("fetch_full", True))
-            max_entries = int(self._cfg("max_entries", 50))
+            max_entries = self._cfg_int("max_entries", 50)
+            # 抓取放在锁外（同步 IO 耗时长，进锁会把并发抓取串行化）
             data = parse_feed(feed_url, fetch_full=fetch_full)
             data["entries"] = data["entries"][:max_entries]
-            self._articles[feed_url] = data
-            self._save_cache(self._articles)
+            # 与 refresh_all 共用同一把锁：否则并发时后写会覆盖前者，磁盘缓存丢源
+            with self._get_cache_lock():
+                self._articles[feed_url] = data
+                self._save_cache(self._articles)
+            # 单源拉取成功日志：便于「添加订阅源」后确认链路是否走通
+            logger.info(
+                f"[{PLUGIN_NAME}] 单源拉取成功 [{data.get('title') or feed_url}] "
+                f"{len(data.get('entries', []))} 条"
+            )
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] 单源刷新失败 {feed_url}: {e}")
 
@@ -1860,6 +2495,20 @@ class RsshubReader(_PluginBase):
             return config.get(key, default)
         except Exception:
             return default
+
+    def _cfg_int(self, key: str, default: int) -> int:
+        """
+        读取整数配置项：值为空串、None 或非数字时回退默认值。
+        配置被手工改成非法值时，int() 会抛 ValueError 并中断刷新/通知主流程，
+        这里统一兜底，保证定时任务与通知不会因单个配置项异常而整体失败。
+        """
+        try:
+            value = int(self._cfg(key, default))
+        except (TypeError, ValueError):
+            return default
+        # 防御 0 与负数：max_entries=0 会把文章列表截断为空、
+        # max_notify_log<=0 会清空通知记录，均非用户预期
+        return value if value > 0 else default
 
 
 # 让 MP 能 import 到类（兼容部分加载方式）
